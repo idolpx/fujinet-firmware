@@ -7,45 +7,203 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include "esp_littlefs.h"
+#include "esp_vfs_fat.h"
 #include <sys/syslimits.h>
+#include <iostream>
+#include <vector>
+#include <esp_heap_caps.h>
+#include <zlib.h>
+#include "../../meatloaf/network/http.h"
+#include "../../meatloaf/media/hd/partition_select.h"
 
+// Defined further down; cp() needs it and sits above the definition.
+static std::string resolve_path(const char *arg);
+
+static inline void *psram_malloc(size_t sz) {
+    void *p = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return p ? p : malloc(sz);
+}
+
+#include "fsFlash.h"
+#include "fnFsSD.h"
+#include "fnConfig.h"
+#ifdef ESP_PLATFORM
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#endif
 #include "../Console.h"
+#include "../console_cancel.h"
+#include "../dos_transfer.h"
 #include "../Helpers/PWDHelpers.h"
 #include "../ute/ute.h"
+#include "../../www/ws/activity.h"
+#include "mlff.h"
+#include "mlConfig.h"
 
-#include "fujiDevice.h"
-#include "display.h"
-#include "meatloaf.h"
-#include "string_utils.h"
+// A std::string/std::vector pair backed by PsramAllocator (mlConfig.h) instead
+// of the default internal-DRAM allocator, for lists that can grow large
+// (e.g. rm -rf * matching thousands of directory entries).
+using psram_string = std::basic_string<char, std::char_traits<char>, PsramAllocator<char>>;
+using psram_string_vector = std::vector<psram_string, PsramAllocator<psram_string>>;
 
-char *canonicalize_file_name(const char *path);
+using namespace ESP32Console;
 
 int cat(int argc, char **argv)
 {
     if (argc == 1)
     {
-        fprintf(stderr, "You have to pass at least one file path!\r\n");
+        Serial.printf("You have to pass at least one file path!\r\n");
         return EXIT_SUCCESS;
     }
 
+    ESP32Console::cancel_begin();
+
     for (int n = 1; n < argc; n++)
     {
-        char filename[PATH_MAX];
-        // We have manually do resolving of . and .., as VFS does not do it
-        ESP32Console::console_realpath(argv[n], filename);
+        std::unique_ptr<MFile> path(getCurrentPath()->cd(argv[n]));
+        Meat::iostream istream(path.get());
 
-        FILE *file = fopen(filename, "r");
-        if (file == nullptr)
-        {
-            fprintf(stderr, "%s %s : %s\r\n", argv[0], filename,
-                    strerror(errno));
-            return errno;
+        if(istream.is_open()) {
+            if(istream.eof()) {
+                Serial.print("Stream returned EOF!");
+            } else {
+                size_t pending = 0;
+                bool cancelled = false;
+                while(!istream.eof()) {
+                    char chr = istream.get();
+                    if(!istream.eof())
+                        Serial.printf("%c", chr);
+
+                    if (++pending >= ESP32Console::DOS_CANCEL_INTERVAL) {
+                        pending = 0;
+                        if (ESP32Console::cancel_requested()) {
+                            cancelled = true;
+                            break;
+                        }
+                    }
+                }
+                Serial.printf("\r\n");
+                if (cancelled) {
+                    Serial.printf("cancelled\r\n");
+                    istream.close();
+                    return EXIT_SUCCESS;
+                }
+            }
+            istream.close();
         }
+        else {
+            Serial.printf("ERROR:%s could not be read!\r\n", path->url.c_str());
+        }
+    }
 
-        int chr;
-        while ((chr = getc(file)) != EOF)
-            fprintf(stdout, "%c", chr);
-        fclose(file);
+    return EXIT_SUCCESS;
+}
+
+int hex(int argc, char **argv)
+{
+    if (argc == 1)
+    {
+        Serial.printf("You have to pass at least one file path!\r\n");
+        return EXIT_SUCCESS;
+    }
+
+    ESP32Console::cancel_begin();
+
+    for (int n = 1; n < argc; n++)
+    {
+        std::unique_ptr<MFile> path(getCurrentPath()->cd(argv[n]));
+        //Debug_printv("Opening file for hex: %s", path->url.c_str());
+        Meat::iostream istream(path.get());
+
+        if(istream.is_open()) {
+            if(istream.eof()) {
+                Serial.printf("Stream returned EOF!");
+            } else {
+                int c = 0;
+                uint32_t size = 0;
+                int address = 0;
+                char b[17] = {0};
+                size_t pending = 0;
+                bool cancelled = false;
+                while(!istream.eof())
+                {
+                    char chr = istream.get();
+
+                    if ( !istream.eof() )
+                    {
+                        if ( c == 0 )
+                        {
+                            Serial.printf("%04X: ", address);
+                            address += 0x10;
+                        }
+
+                        Serial.printf("%02X ", chr);
+
+                        // replace non-printable characters
+                        if ( chr < 32 || chr > 126 )
+                            chr = '.';
+
+                        b[c] = chr;
+                    }
+                    size++;
+
+                    // add padding
+                    if ( istream.eof() && c )
+                    {
+                        if ( c <= 0x07 )
+                        {
+                            while ( c++ < 0x08 )
+                                Serial.printf("   ");
+
+                            Serial.printf("| ");
+                            c--;
+                        }
+
+                        while ( c++ < 0x10 )
+                            Serial.printf("   ");
+                    }
+                    else if ( c++ == 0x07 )
+                    {
+                        // add separator
+                        Serial.printf("| ");
+                    }
+
+                    // show line data as ascii
+                    if ( c >= 0x10 )
+                    {
+                        Serial.printf(" |%-16s|\r\n", b);
+                        c = 0;
+                        memset(b, 0, sizeof(b));
+
+                        // One completed line is 16 bytes, so this lands on the
+                        // cancel interval exactly.
+                        pending += 0x10;
+                        if ( pending >= ESP32Console::DOS_CANCEL_INTERVAL )
+                        {
+                            pending = 0;
+                            if ( ESP32Console::cancel_requested() )
+                            {
+                                cancelled = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                Serial.printf("\r\n");
+                if ( cancelled )
+                {
+                    Serial.printf("cancelled after %u bytes\r\n", size);
+                    istream.close();
+                    return EXIT_SUCCESS;
+                }
+                Serial.printf("url[%s] size[%u]\r\n", path->url.c_str(), --size);
+            }
+            istream.close();
+        }
+        else {
+            Serial.printf("ERROR:%s could not be read!\r\n", path->url.c_str());
+        }
     }
 
     return EXIT_SUCCESS;
@@ -53,7 +211,7 @@ int cat(int argc, char **argv)
 
 int pwd(int argc, char **argv)
 {
-    printf("%s\r\n", ESP32Console::console_getpwd());
+    Serial.printf("%s\r\n", getCurrentPath()->fullUrl().c_str());
     return EXIT_SUCCESS;
 }
 
@@ -66,7 +224,7 @@ int cd(int argc, char **argv)
         path = getenv("HOME");
         if (!path)
         {
-            fprintf(stderr, "No HOME env variable set!\r\n");
+            Serial.printf("No HOME env variable set!\r\n");
             return EXIT_FAILURE;
         }
     }
@@ -75,245 +233,512 @@ int cd(int argc, char **argv)
         path = argv[1];
     }
 
-    // Check if target path is a file
-    char resolved[PATH_MAX];
-    ESP32Console::console_realpath(path, resolved);
+    std::unique_ptr<MFile> destPath(getCurrentPath()->cd(argv[1]));
 
-    // Get file stats
-    struct stat st;
-    stat(resolved, &st);
-    //Debug_printv("path[%s] resolved[%s]", path, resolved);
-
-    // If we can open it, then we can not chdir into it.
-    //FILE *file = fopen(resolved, "r");
-    //if (file)
-    if(!S_ISDIR(st.st_mode))
-    {
-        //fclose(file);
-        fprintf(stderr, "cd: not a directory: %s\r\n", path);
-        return 1;
-    }
-
-
-    // Check if the new PWD exists, and show a warning if not
-    //const char *pwd = ESP32Console::console_getpwd();
-    DIR *dir = opendir(resolved);
-    if (dir)
-    {
-        closedir(dir);
-
-        if (ESP32Console::console_chdir(path))
-        {
-            fprintf(stderr, "Error: %s\r\n", strerror(errno));
-            return 1;
-        }
-    }
-    // else if (ENOENT == errno)
-    // {
-    //     fprintf(stderr, "cd: no such file or directory: %s\r\n", path);
-    // }
-
-    return EXIT_SUCCESS;
-}
-
-int ls(int argc, char **argv)
-{
-    char *inpath;
-    if (argc == 1)
-    {
-        inpath = (char *)".";
-    }
-    else if (argc == 2)
-    {
-        inpath = argv[1];
-    }
-    else
-    {
-        printf("You can pass only one filename!\r\n");
-        return 1;
-    }
-
-    char path[PATH_MAX];
-    ESP32Console::console_realpath(inpath, path);
-
-    DIR *dir = opendir(path);
-    if (!dir)
-    {
-        fprintf(stderr, "Could not open filepath: %s\r\n", strerror(errno));
-        return 1;
-    }
-
-    struct dirent *d;
-    struct stat st;
-
-    // Add "sd" if we are at the root
-    if ( mstr::equals(path, (char *)"/", false) )
-    {
-        printf("d %8u  sd\r\n", 0);
-    }
-
-    while ((d = readdir(dir)) != NULL)
-    {
-        std::string filename = path;
-        filename += "/";
-        filename += d->d_name;
-        stat(filename.c_str(), &st);
-        printf("%c %8lu  %s\r\n", (S_ISDIR(st.st_mode)) ? 'd':'-', st.st_size, d->d_name);
-    }
-
-    closedir(dir);
-    return EXIT_SUCCESS;
-}
-
-int mv(int argc, char **argv)
-{
-    if (argc != 3)
-    {
-        fprintf(stderr, "Syntax is mv [ORIGIN] [TARGET]\r\n");
-        return 1;
-    }
-
-    char old_name[PATH_MAX], new_name[PATH_MAX];
-
-    // Resolve arguments to full path
-    ESP32Console::console_realpath(argv[1], old_name);
-    ESP32Console::console_realpath(argv[2], new_name);
-
-    // Do rename
-    if (rename(old_name, new_name))
-    {
-        printf("Error moving: %s\r\n", strerror(errno));
+    Debug_printv("url[%s] path[%s] pathInStream[%s]", destPath->url.c_str(), path, destPath->pathInStream.c_str());
+    if(destPath->isDirectory()) {
+        // setCurrentPath deletes the previous path object (a leaked MFile
+        // would pin its network session's shared_ptr forever)
+        setCurrentPath(destPath.release());
+    } else {
+        Serial.printf("cd: not a directory: %s\r\n", path);
         return EXIT_FAILURE;
     }
 
     return EXIT_SUCCESS;
 }
 
-int cp(int argc, char **argv)
+int ls(int argc, char **argv)
 {
-    //TODO: Shows weird error message
-    if (argc != 3)
-    {
-        fprintf(stderr, "Syntax is cp [ORIGIN] [TARGET]\r\n");
-        return 1;
-    }
-
-    char old_name[PATH_MAX], new_name[PATH_MAX];
-
-    // Resolve arguments to full path
-    ESP32Console::console_realpath(argv[1], old_name);
-    ESP32Console::console_realpath(argv[2], new_name);
-
-    // Do copy
-    FILE *origin = fopen(old_name, "r");
-    if (!origin)
-    {
-        fprintf(stderr, "Error opening origin file: %s\r\n", strerror(errno));
-        return 1;
-    }
-
-    FILE *target = fopen(new_name, "w");
-    if (!target)
-    {
-        fclose(origin);
-        fprintf(stderr, "Error opening target file: %s\r\n", strerror(errno));
-        return 1;
-    }
-
-    int buffer;
-
-    // Clear existing errors
-    auto error = errno;
-
-    while ((buffer = getc(origin)) != EOF)
-    {
-        if(fputc(buffer, target) == EOF) {
-            fprintf(stderr, "Error writing: %s\r\n", strerror(errno));
-            fclose(origin); fclose(target);
-            return 1;
+    MFile* listPath = nullptr;
+    const char *path_arg = nullptr;
+    bool show_hidden = false;
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] != '-')
+            path_arg = argv[i];
+        else
+        {
+            // -a shows hidden entries. Other flags (-l, -h, ...) are accepted
+            // and ignored so habitual "ls -la" still works.
+            for (const char *p = argv[i] + 1; *p; p++)
+                if (*p == 'a' || *p == 'A') show_hidden = true;
         }
     }
 
-    error = errno;
-    if (error && !feof(origin))
+    // A wildcard in the LAST component filters the listing instead of naming
+    // something to descend into ("ls fb*", "ls /sd/games/*.d64"). Without this
+    // the pattern reaches cd(), which resolves it to the FIRST matching entry
+    // and then lists that single file as though it were a directory.
+    std::string arg = (path_arg == nullptr) ? "" : path_arg;
+    size_t slash = arg.find_last_of('/');
+    std::string pattern = (slash == std::string::npos) ? arg : arg.substr(slash + 1);
+    bool filtered = pattern.find('*') != std::string::npos ||
+                    pattern.find('?') != std::string::npos;
+
+    if (filtered && slash != std::string::npos)
     {
-        fprintf(stderr, "Error copying: %s\r\n", strerror(error));
-        fclose(origin);
-        fclose(target);
-        return 1;
+        // Keep the trailing '/' so a rooted "/fb*" still resolves to "/"
+        listPath = getCurrentPath()->cd(arg.substr(0, slash + 1));
+    }
+    else if (filtered || path_arg == nullptr)
+    {
+        listPath = MFSOwner::File(getCurrentPath()->fullUrl());
+    }
+    else
+    {
+        listPath = getCurrentPath()->cd(path_arg);
     }
 
-    fclose(origin);
-    fclose(target);
+    //Debug_printv("ls path[%s]", listPath->url.c_str());
+    std::unique_ptr<MFile> destPath(listPath);
+    std::unique_ptr<MFile> entry(destPath->getNextFileInDir());
+
+    if(entry.get() == nullptr) {
+        // Empty directory
+        return EXIT_SUCCESS;
+    }
+
+    // If sd card is mounted and we are at root
+    if( getCurrentPath()->url.size() == 1 )
+    {
+        if ( fnSDFAT.running() && ( !filtered || mstr::compare("sd", pattern, false) ) )
+            Serial.printf("d %8lu  \"sd\"\r\n", 0);
+
+#ifndef MIN_CONFIG
+        if ( !filtered || mstr::compare("network", pattern, false) )
+            Serial.printf("d %8lu  \"network\"\r\n", 0);
+#endif
+    }
+
+    while(entry.get() != nullptr) {
+        // An unnamed entry is a free or scratched directory slot, not a file.
+        // A CBM directory is a fixed array of slots, so the tail of one is
+        // normally full of them - listing them made a healthy image look
+        // corrupt. They are never shown, not even with -a: there is nothing
+        // there to show.
+        bool nameless = entry->name.empty();
+
+        // Compare against the raw entry name, before the UTF-8 conversion
+        // below rewrites it (same basis rm's wildcard branch matches on).
+        if ( !nameless &&
+             (show_hidden || !entry->is_hidden) &&
+             ( !filtered || mstr::compare(entry->name, pattern, false) ) )
+        {
+            // No conversion here: entry->name is UTF-8 whatever produced it.
+            // Media filesystems convert their PETSCII on-disk names once, in
+            // getNextFileInDir(), so the name printed is the name seekPath()
+            // matches and the name that can be typed back.
+            mstr::replaceAll(entry->name, "\"", "\\\""); // Escape double quotes
+
+            // 'd' directory, 'h' hidden (only reachable with -a), '-' regular.
+            char kind = entry->isDirectory() ? 'd' : (entry->is_hidden ? 'h' : '-');
+            Serial.printf("%c %8lu  \"%s\"\r\n", kind, entry->size, entry->name.c_str());
+        }
+        entry.reset(destPath->getNextFileInDir());
+    }
 
     return EXIT_SUCCESS;
 }
 
-int rm(int argc, char **argv)
+// Switch the selected partition of the CMD HD/FD or IDE64 CFS image the
+// console is inside. The selection belongs to the IMAGE, not to any one
+// MFile, which is why this takes no image argument: it always acts on the
+// container in the current path. This is the console's equivalent of CP<n>.
+int partition(int argc, char **argv)
 {
-    if (argc != 2)
+    hdpart::Target t = hdpart::targetFor(getCurrentPath()->url);
+    if (!t)
     {
-        fprintf(stderr, "You have to pass exactly one file. Syntax rm [FILE]\r\n");
+        Serial.printf("partition: not inside a partitioned disk image\r\n");
+        return EXIT_FAILURE;
+    }
+
+    std::vector<hdpart::View> parts;
+    std::string disk_label;
+    if (!hdpart::list(t, parts, disk_label))
+    {
+        Serial.printf("partition: cannot read the partition table of '%s'\r\n",
+                      t.container.c_str());
+        return EXIT_FAILURE;
+    }
+
+    // No argument: list. CMD names are PETSCII on disk and are already
+    // converted to UTF-8 by hdpart::list(), which is what `ls` shows and what
+    // the name lookup matches against.
+    if (argc < 2)
+    {
+        Serial.printf("   #  type   name\r\n");
+        for (const auto &p : parts)
+        {
+            Serial.printf("%c%3u  %-5s  \"%s\"\r\n",
+                          p.selected ? '*' : ' ',
+                          (unsigned)p.number,
+                          p.type_label.c_str(),
+                          p.name.c_str());
+        }
         return EXIT_SUCCESS;
     }
 
-    char filename[PATH_MAX];
-    ESP32Console::console_realpath(argv[1], filename);
-    //Debug_printv("filename[%s]", filename);
-
-    if ( strlen(filename) > 1 && filename[strlen(filename) - 1] == '*' )
+    std::string arg = argv[1];
+    int number = hdpart::resolve(t, arg);
+    if (number < 0)
     {
-        char path[PATH_MAX];
-        ESP32Console::console_realpath(".", path);
+        Serial.printf("partition: no such partition: %s\r\n", arg.c_str());
+        return EXIT_FAILURE;
+    }
 
-        DIR *dir = opendir(path);
-        struct dirent *d;
-        while ((d = readdir(dir)) != NULL)
+    // Copy what we need before select(), which may dispose cached streams.
+    std::string name;
+    std::string type_label;
+    bool selectable = false;
+    for (const auto &p : parts)
+    {
+        if (p.number == (uint8_t)number)
         {
-            std::string pattern = filename;
-            std::string match_file = path;
-            if (strlen(path) > 1)
-                match_file += "/";
-            match_file += d->d_name;
-            //Debug_printv("pattern[%s] match_file[%s]", pattern.c_str(), match_file.c_str());
-            if ( mstr::compare(pattern, match_file, false) )
+            name = p.name;
+            type_label = p.type_label;
+            selectable = p.selectable;
+            break;
+        }
+    }
+
+    // Reachable both by number and by name, since every table entry is listed.
+    if (!selectable)
+    {
+        Serial.printf("partition: %u \"%s\" (%s) cannot be selected\r\n",
+                      (unsigned)number, name.c_str(), type_label.c_str());
+        return EXIT_FAILURE;
+    }
+
+    if (!hdpart::select(t, number))
+    {
+        Serial.printf("partition: could not select partition %u\r\n", (unsigned)number);
+        return EXIT_FAILURE;
+    }
+
+    // The old cwd may name a subdirectory that existed only in the previous
+    // partition, so drop back to the image root.
+    setCurrentPath(MFSOwner::File(t.container));
+
+    Serial.printf("Selected partition %u \"%s\" (%s)\r\n",
+                  (unsigned)number, name.c_str(), type_label.c_str());
+    return EXIT_SUCCESS;
+}
+
+// Shared by cp and mv. Resolves both sides through MFSOwner, so either end may
+// be inside a disk image or an archive, or a URL. Returns false having already
+// printed the reason. 'verb' only names the caller in messages.
+static bool copy_via_mfile(const char *verb,
+                           const std::string &src, std::string &dst,
+                           size_t *out_total)
+{
+    std::unique_ptr<MFile> srcFile(MFSOwner::File(src));
+    if (!srcFile || !srcFile->exists())
+    {
+        Serial.printf("%s: cannot open '%s': No such file or directory\r\n", verb, src.c_str());
+        return false;
+    }
+    if (srcFile->isDirectory())
+    {
+        Serial.printf("%s: '%s' is a directory\r\n", verb, src.c_str());
+        return false;
+    }
+
+    // "<verb> file dir" puts it INSIDE dir, as cp(1)/mv(1) do.
+    {
+        std::unique_ptr<MFile> dstProbe(MFSOwner::File(dst));
+        if (dstProbe && dstProbe->exists() && dstProbe->isDirectory())
+        {
+            // Take the name from the source PATH, not srcFile->name. For a
+            // path inside a container, MFile::name is the CONTAINER's name -
+            // only getNextFileInDir() overrides it with the entry's name (see
+            // the comment in D64MFile::getNextFileInDir). Using it turned
+            // "cp raw/digiplayer.mod ." into a file called "hdbackup.dhd".
+            size_t s = src.find_last_of('/');
+            std::string base = (s == std::string::npos) ? src : src.substr(s + 1);
+            if (base.empty())
             {
-                if (remove(match_file.c_str()))
-                {
-                    fprintf(stderr, "Error removing %s: %s\r\n", filename, strerror(errno));
-                    closedir(dir);
-                    return EXIT_FAILURE;
-                }
-                printf("%s removed\r\n", d->d_name);
+                Serial.printf("%s: cannot derive a name from '%s'\r\n", verb, src.c_str());
+                return false;
+            }
+            while (dst.size() > 1 && dst.back() == '/') dst.pop_back();
+            dst += "/" + base;
+        }
+    }
+
+    auto in = srcFile->getSourceStream(std::ios_base::in);
+    if (!in || !in->isOpen())
+    {
+        Serial.printf("%s: cannot read '%s'\r\n", verb, src.c_str());
+        return false;
+    }
+
+    std::unique_ptr<MFile> dstFile(MFSOwner::File(dst));
+    auto out = dstFile ? dstFile->getSourceStream(std::ios_base::out) : nullptr;
+    if (!out || !out->isOpen())
+    {
+        Serial.printf("%s: cannot create '%s'\r\n", verb, dst.c_str());
+        return false;
+    }
+
+    const uint32_t bufSize = 4096;
+    uint8_t *buf = (uint8_t *)psram_malloc(bufSize);
+    if (!buf)
+    {
+        Serial.printf("%s: out of memory\r\n", verb);
+        return false;
+    }
+
+    size_t total = 0;
+    bool ok = true;
+    uint32_t n;
+    while ((n = in->read(buf, bufSize)) > 0)
+    {
+        if (out->write(buf, n) != n)
+        {
+            Serial.printf("%s: write failed after %zu bytes\r\n", verb, total);
+            ok = false;
+            break;
+        }
+        total += n;
+    }
+
+    free(buf);
+    out->close();
+
+    if (out_total) *out_total = total;
+    return ok;
+}
+
+int mv(int argc, char **argv)
+{
+    if (argc != 3)
+    {
+        Serial.printf("Syntax is mv [ORIGIN] [TARGET]\r\n");
+        return EXIT_FAILURE;
+    }
+
+    std::string src = resolve_path(argv[1]);
+    std::string dst = resolve_path(argv[2]);
+
+    // Same directory: this is a pure rename, which every filesystem can do
+    // in place. MFile::rename() takes a NAME relative to the file's own
+    // directory (see FlashMFile::rename), not a path, so only this case can
+    // use it.
+    size_t s_slash = src.find_last_of('/');
+    size_t d_slash = dst.find_last_of('/');
+    if (s_slash != std::string::npos && d_slash != std::string::npos &&
+        src.compare(0, s_slash, dst, 0, d_slash) == 0 && s_slash == d_slash)
+    {
+        std::unique_ptr<MFile> srcFile(MFSOwner::File(src));
+        if (srcFile && srcFile->exists() && srcFile->rename(dst.substr(d_slash + 1)))
+            return EXIT_SUCCESS;
+        // Fall through: media filesystems return false from rename() rather
+        // than implementing it, so a failure here is expected, not fatal.
+    }
+
+    // Anything else - a different directory, or crossing between SD, flash,
+    // a disk image or an archive - is a copy followed by a delete. rename(2)
+    // cannot move data across those boundaries at all.
+    size_t total = 0;
+    if (!copy_via_mfile("mv", src, dst, &total))
+        return EXIT_FAILURE;
+
+    // Only unlink the source once the copy has fully succeeded, so a failed
+    // move never destroys the original.
+    std::unique_ptr<MFile> srcFile(MFSOwner::File(src));
+    if (!srcFile || !srcFile->remove())
+    {
+        Serial.printf("mv: copied to '%s' but could not remove '%s' - left both\r\n",
+                      dst.c_str(), src.c_str());
+        return EXIT_FAILURE;
+    }
+
+    Serial.printf("%s -> %s (%zu bytes)\r\n", src.c_str(), dst.c_str(), total);
+    return EXIT_SUCCESS;
+}
+
+int cp(int argc, char **argv)
+{
+    if (argc != 3)
+    {
+        Serial.printf("Syntax is cp [ORIGIN] [TARGET]\r\n");
+        return EXIT_FAILURE;
+    }
+
+    // Goes through MFile, not fopen(). The POSIX path only sees real files on
+    // flash and SD, so copying out of a disk image, an archive or a URL was
+    // impossible - "cp bible/read.me x" inside a .dhd failed with ENOENT
+    // because that path exists only to the media layer. cat/hex/ls/wget all
+    // resolve through MFSOwner already; cp and mv were the holdouts.
+    std::string src = resolve_path(argv[1]);
+    std::string dst = resolve_path(argv[2]);
+
+    size_t total = 0;
+    if (!copy_via_mfile("cp", src, dst, &total))
+        return EXIT_FAILURE;
+
+    Serial.printf("%s -> %s (%zu bytes)\r\n", src.c_str(), dst.c_str(), total);
+    return EXIT_SUCCESS;
+}
+
+// Recursively deletes a file or directory tree via MFile, so it works for
+// any MFSOwner-addressable path (not just local flash/SD). Returns true if
+// the path is gone by the time this returns (or -f suppressed the failure).
+static bool rm_path(const std::string &path, bool recursive, bool force)
+{
+    std::unique_ptr<MFile> f(MFSOwner::File(path));
+    if (!f || !f->exists())
+    {
+        if (!force)
+            Serial.printf("rm: cannot remove '%s': No such file or directory\r\n", path.c_str());
+        return force;
+    }
+
+    if (f->isDirectory())
+    {
+        // Some "directories" (a D64/D81/etc. container file sitting directly
+        // on a real filesystem, or an empty real directory) are actually a
+        // single removable entry from the underlying filesystem's point of
+        // view — try direct removal before requiring -r for real recursive
+        // descent into a non-empty directory.
+        if (f->remove())
+        {
+            Serial.printf("%s removed\r\n", path.c_str());
+            return true;
+        }
+
+        if (!recursive)
+        {
+            if (!force)
+                Serial.printf("rm: cannot remove '%s': Is a directory\r\n", path.c_str());
+            return force;
+        }
+
+        bool ok = true;
+        f->rewindDirectory();
+        MFile *rawEntry;
+        while ((rawEntry = f->getNextFileInDir()) != nullptr)
+        {
+            std::unique_ptr<MFile> entry(rawEntry);
+            if (entry->name == "." || entry->name == "..")
+                continue;
+            if (!rm_path(path + "/" + entry->name, recursive, force))
+                ok = false;
+        }
+
+        if (!f->rmDir())
+        {
+            if (!force)
+                Serial.printf("rm: cannot remove '%s'\r\n", path.c_str());
+            return force;
+        }
+        Serial.printf("%s removed\r\n", path.c_str());
+        return ok;
+    }
+
+    if (!f->remove())
+    {
+        if (!force)
+            Serial.printf("rm: cannot remove '%s': %s\r\n", path.c_str(), strerror(errno));
+        return force;
+    }
+    Serial.printf("%s removed\r\n", path.c_str());
+    return true;
+}
+
+int rm(int argc, char **argv)
+{
+    bool recursive = false;
+    bool force = false;
+    int argi = 1;
+
+    // Parse leading -r/-f/-rf style flags (combined single-dash groups).
+    while (argi < argc && argv[argi][0] == '-' && argv[argi][1] != '\0')
+    {
+        for (const char *p = argv[argi] + 1; *p; p++)
+        {
+            if (*p == 'r' || *p == 'R') recursive = true;
+            else if (*p == 'f') force = true;
+            else
+            {
+                Serial.printf("rm: invalid option -- '%c'\r\n", *p);
+                return EXIT_FAILURE;
             }
         }
-        closedir(dir);
-    }
-    else
-    {
-        if(remove(filename)) {
-            fprintf(stderr, "Error removing %s: %s\r\n", filename, strerror(errno));
-            return EXIT_FAILURE;
-        }
-        printf("%s removed\r\n", filename);
+        argi++;
     }
 
-    return EXIT_SUCCESS;
+    if (argi >= argc)
+    {
+        Serial.printf("Usage: rm [-rf] FILE...\r\n");
+        return EXIT_SUCCESS;
+    }
+
+    bool anyFailed = false;
+
+    for (; argi < argc; argi++)
+    {
+        std::string pattern = argv[argi];
+
+        if (pattern.find('*') != std::string::npos || pattern.find('?') != std::string::npos)
+        {
+            // List matches first, then delete — removing entries while
+            // iterating the directory handle isn't safe on all backing
+            // filesystems.
+            MFile *cwd = getCurrentPath();
+            psram_string_vector matches;
+            cwd->rewindDirectory();
+            MFile *rawEntry;
+            while ((rawEntry = cwd->getNextFileInDir()) != nullptr)
+            {
+                std::unique_ptr<MFile> entry(rawEntry);
+                if (entry->name == "." || entry->name == "..")
+                    continue;
+                // fullUrl(), not url: inside a container url is the CONTAINER's
+                // path and the part within it lives in pathInStream. See the
+                // comment on the non-wildcard branch below.
+                if (mstr::compare(entry->name, pattern, false))
+                    matches.emplace_back((cwd->fullUrl() + "/" + entry->name).c_str());
+            }
+
+            if (matches.empty() && !force)
+                Serial.printf("rm: no matches for '%s'\r\n", pattern.c_str());
+
+            for (auto &m : matches)
+                if (!rm_path(std::string(m.c_str()), recursive, force))
+                    anyFailed = true;
+        }
+        else
+        {
+            std::unique_ptr<MFile> target(getCurrentPath()->cd(argv[argi]));
+
+            // fullUrl(), NOT url. For anything inside a container, url is the
+            // CONTAINER's path and the part within it is held separately in
+            // pathInStream - so passing url alone silently rewrites
+            // "rm fb" inside hdbackup.dhd into "rm hdbackup.dhd" and deletes
+            // the whole image. rm_path() takes a string and re-resolves it, so
+            // it can only see what the string carries.
+            if (!target || !rm_path(target->fullUrl(), recursive, force))
+                anyFailed = true;
+        }
+    }
+
+    return anyFailed ? EXIT_FAILURE : EXIT_SUCCESS;
 }
 
 int rmdir(int argc, char **argv)
 {
     if (argc != 2)
     {
-        fprintf(stderr, "You have to pass exactly one file. Syntax rmdir [DIRECTORY]\r\n");
+        Serial.printf("You have to pass exactly one file. Syntax rmdir [DIRECTORY]\r\n");
         return EXIT_SUCCESS;
     }
 
-    char filename[PATH_MAX];
-    ESP32Console::console_realpath(argv[1], filename);
+    std::unique_ptr<MFile> rd(getCurrentPath()->cd(argv[1]));
 
-    if(rmdir(filename)) {
-        fprintf(stderr, "Error deleting %s: %s\r\n", filename, strerror(errno));
+    if(!rd->rmDir()) {
+        Serial.printf("Error deleting %s: %s\r\n", rd->url.c_str(), strerror(errno));
     }
 
     return EXIT_SUCCESS;
@@ -323,15 +748,14 @@ int mkdir(int argc, char **argv)
 {
     if (argc != 2)
     {
-        fprintf(stderr, "You have to pass exactly one file. Syntax mkdir [DIRECTORY]\r\n");
+        Serial.printf("You have to pass exactly one file. Syntax mkdir [DIRECTORY]\r\n");
         return EXIT_SUCCESS;
     }
 
-    char directory[PATH_MAX];
-    ESP32Console::console_realpath(argv[1], directory);
+    std::unique_ptr<MFile> md(getCurrentPath()->cd(argv[1]));
 
-    if(mkdir(directory, 0755)) {
-        fprintf(stderr, "Error creating %s: %s\r\n", directory, strerror(errno));
+    if(!md->mkDir()) {
+        Serial.printf("Error creating %s: %s\r\n", md->url.c_str(), strerror(errno));
     }
 
     return EXIT_SUCCESS;
@@ -339,98 +763,1610 @@ int mkdir(int argc, char **argv)
 
 int mount(int argc, char **argv)
 {
-    if (argc != 3)
+    if (argc < 2)
     {
-        fprintf(stderr, "mount {device id} {url}\r\n");
+        //Serial.printf("mount {device id} {url/path/filename}\r\n");
+
+        Serial.printf("IEC drive mounts:\r\n");
+        for (int i = 0; i < MAX_DISK_DEVICES; i++)
+        {
+            // Show device status
+            auto drive = Meatloaf.get_disks(i);
+            if (drive != nullptr)
+            {
+                Serial.printf(" #%-2d: %s %s\r\n", i + 8, drive->disk_dev.getCWD().c_str(), (Config.get_device_slot_enable(i+1) ? "":"[disabled]")); //"%d: %s\r\n", drive->disk_dev.getCWD().c_str();
+            }
+        }
+
         return EXIT_SUCCESS;
     }
 
     if (!mstr::isNumeric(argv[1]))
     {
-        fprintf(stderr, "device id is not numeric\r\n");
+        Serial.printf("device id is not numeric\r\n");
         return EXIT_SUCCESS;
     }
 
-    int did = atoi(argv[1]);
-    fprintf(stdout, "Mounted %d -> %s\r\n", did, argv[2]);
+    // Device ID
+    int did = atoi(argv[1]) - 8;
 
-    theFuji->fujicmd_mount_all_success();
+    std::string filename;
+    // filename.reserve(getCurrentPath()->url.size() + 1);
+    filename = getCurrentPath()->fullUrl();   // see resolve_path()
+    if ( argc > 2 )
+    {
+        // Use current path + filename. An argument that is already absolute -
+        // a scheme ("http://...") or a leading '/' - names the target on its
+        // own; appending it to the cwd produced "///sd/x.hdd", which only
+        // resolved by accident when the drive was not sitting in an image.
+        if ( mstr::contains(argv[2], ":") || argv[2][0] == '/' )
+        {
+            filename = argv[2];
+        }
+        else
+        {
+            filename += '/';
+            filename += argv[2];
+        }
+    }
+
+    Debug_printv("device id[%d] url[%s]", did, filename.c_str());
+
+    auto drive = Meatloaf.get_disks(did);
+    if (drive != nullptr)
+    {
+        drive->disk_dev.mount(NULL, filename.c_str(), 0);
+    }
+    else
+    {
+        Serial.printf("Error mounting: device #%02d not enabled\r\n", did);
+    }
+
+    return EXIT_SUCCESS;
+}
+
+int auth(int argc, char **argv)
+{
+    if (argc != 3)
+    {
+        Serial.printf("auth {username} {password}\r\n");
+        return EXIT_SUCCESS;
+    }
+
+    MFile* p = getCurrentPath();
+    p->user = argv[1];
+    p->password = argv[2];
+    p->rebuildUrl();
+    Serial.printf("Auth set for %s\r\n", p->url.c_str());
 
     return EXIT_SUCCESS;
 }
 
 int wget(int argc, char **argv)
 {
-    if (argc != 2)
-    {
-        fprintf(stderr, "wget {url}\r\n");
+    bool insecure = false;
+    const char *url_arg = nullptr;
+
+    if (argc == 2) {
+        url_arg = argv[1];
+    } else if (argc == 3 && strcmp(argv[1], "-k") == 0) {
+        insecure = true;
+        url_arg = argv[2];
+    } else {
+        Serial.printf("wget [-k] {url}\r\n");
         return EXIT_SUCCESS;
     }
 
-    std::string pwd = std::string(ESP32Console::console_getpwd());
+    std::string pwd = getCurrentPath()->fullUrl();   // see resolve_path()
 
-    auto f = MFSOwner::File(argv[1]);
+    if (insecure)
+        http_set_insecure(true);
+
+    // Discard any reason left over from an earlier command so a failure here
+    // that never reaches the network can't inherit it.
+    http_clear_tls_error();
+
+    std::unique_ptr<MFile>f(MFSOwner::File(url_arg));
     if (f != nullptr)
     {
         auto s = f->getSourceStream();
+        // For a container format (archive, disk image) fetched at its own
+        // bare URL, getSourceStream() returns an unopened decoder — opening
+        // only happens via seekPath()/rewindDirectory(), neither of which
+        // apply here. Fall back to sourceFile's raw, undecoded stream so a
+        // plain wget saves the container's actual bytes instead of failing.
+        if ((!s || !s->isOpen()) && f->sourceFile != nullptr)
+            s = f->sourceFile->getSourceStream();
+        // A rejected certificate means there is nothing to download.  Report it
+        // BEFORE deriving an output name or touching the filesystem: a bare
+        // host URL yields an empty name, and the resulting "can't open file"
+        // masked the real reason.  Cannot leak the insecure flag - with -k
+        // there is no verification and so no TLS error to trip this.
+        if (http_had_tls_error())
+        {
+            Serial.printf("wget: cannot open '%s'\r\n", url_arg);
+            Serial.printf("TLS: %s\r\n     Retry with 'wget -k' to skip verification.\r\n",
+                          http_last_tls_error().c_str());
+            return 1;
+        }
+        if (!s)
+        {
+            Serial.printf("wget: cannot open '%s'\r\n", url_arg);
+            return 1;
+        }
+        std::string outname = f->getDownloadFilename();
 
-        std::string outfile = pwd;
-        outfile += f->name;
+        std::string outfile;
+        outfile.reserve(pwd.size() + 1 + outname.size());
+        outfile = pwd;
+        outfile += '/';
+        outfile += outname;
 
-        Debug_printv("size[%lu] name[%s] url[%s] outfile[%s]", f->size, f->name.c_str(), s->url.c_str(), outfile.c_str());
+        Debug_printv("size[%lu] name[%s] url[%s] outfile[%s]", f->size, outname.c_str(), s->url.c_str(), outfile.c_str());
 
 
         FILE *file = fopen(outfile.c_str(), "w");
         if (file == nullptr)
         {
-            fprintf(stdout, "2 Error: Can't open file!\r\n");
+            Serial.printf("2 Error: Can't open file!\r\n");
             return 2;
         }
 
         // Receive File
         int count = 0;
-        uint8_t bytes[256];
+        size_t total_written = 0;
+        uint8_t *bytes = (uint8_t *)psram_malloc(256);
         while (true)
         {
             int bytes_read = s->read(bytes, 256);
             if (bytes_read < 1)
-            {
-                if (s->available())
-                    fprintf(stdout, "\nError reading '%s'\r", f->name.c_str());
                 break;
-            }
 
             int bytes_written = fwrite(bytes, 1, bytes_read, file);
             if (bytes_written != bytes_read)
             {
-                fprintf(stdout, "\nError writing '%s'\r", f->name.c_str());
+                Serial.printf("\nError writing '%s'\r", outname.c_str());
                 break;
             }
+            total_written += bytes_written;
 
             // Show percentage complete in stdout
-            uint8_t percent = (s->position() * 100) / s->size();
+            uint8_t percent = (f->size > 0) ? (s->position() * 100) / f->size : 0;
 #ifdef ENABLE_DISPLAY
-            DISPLAY.progress = percent;
+            LEDS.progress = percent;
 #endif
-            fprintf(stdout, "Downloading '%s' %d%% [%lu]\r", f->name.c_str(), percent, s->position());
+            Serial.printf("Downloading '%s' %d%% [%lu]\r", outname.c_str(), percent, s->position());
             count++;
         }
+        free(bytes);
         fclose(file);
-        fprintf(stdout, "\n");
+
+        if (total_written == 0)
+        {
+            Serial.printf("\nError: Download failed, removing empty file '%s'\r\n", outfile.c_str());
+            remove(outfile.c_str());
+            if (http_had_tls_error())
+                Serial.printf("TLS: %s\r\n     Retry with 'wget -k' to skip verification.\r\n",
+                              http_last_tls_error().c_str());
+        }
+        else
+        {
+            Serial.printf("\n");
+        }
+        //delete f;
     }
 
+    if (insecure)
+        http_set_insecure(false);
+
 #ifdef ENABLE_DISPLAY
-    DISPLAY.idle();
+    LEDS.idle();
 #endif
 
     return EXIT_SUCCESS;
 }
+
+int update(int argc, char **argv)
+{
+#if(NO_UPDATES)
+    Serial.printf("Not updating; live updates disabled.\r\n");
+#else
+    // Get current app version
+    std::string current_version = fnSystem.get_fujinet_version(true);
+    Debug_printf("Current firmware version: %s\r\n", current_version.c_str());
+
+    // Check for updates
+
+    Serial.printf("Stopping flash filesystem...\r\n");
+    fsFlash.stop();
+
+    // TODO:  Add support for SDMMC.
+    Serial.println("Flash bin files from '/sd/.bin/'");
+    mlff_update(PIN_SD_HOST_CS, PIN_SD_HOST_MISO, PIN_SD_HOST_MOSI, PIN_SD_HOST_SCK);
+
+    Serial.println("Reboot to run update app and flash 'main.*.bin'...");
+    esp_restart();
+#endif
+
+    return EXIT_SUCCESS;
+}
+
+
+static void df_print_row(const char *label, const char *path, uint64_t total, uint64_t avail)
+{
+    uint64_t used = total - avail;
+    uint32_t pct  = total ? (uint32_t)(used * 100 / total) : 0;
+    Serial.printf("%-6s  %8lu KB  %8lu KB  %8lu KB  %3lu%%  %s\r\n",
+        label,
+        (unsigned long)(total / 1024),
+        (unsigned long)(used  / 1024),
+        (unsigned long)(avail / 1024),
+        (unsigned long)pct,
+        path);
+
+    char msg[64];
+    snprintf(msg, sizeof(msg), "%llu, %llu", (unsigned long long)total, (unsigned long long)avail);
+    notify_activity(label, "df", msg);
+}
+
+static int df(int argc, char **argv)
+{
+    Serial.printf("%-6s  %11s  %11s  %11s  %4s  %s\r\n",
+        "FS", "Size", "Used", "Avail", "Use%", "Mounted on");
+
+    size_t lfs_total = 0, lfs_used = 0;
+    if (esp_littlefs_info("storage", &lfs_total, &lfs_used) == ESP_OK)
+        df_print_row("flash", "/", lfs_total, lfs_total - lfs_used);
+    else {
+        Serial.printf("%-6s  not available\r\n", "flash");
+        notify_activity("flash", "df", "0, 0");
+    }
+
+#ifdef SD_CARD
+    uint64_t fat_total = 0, fat_free = 0;
+    if (esp_vfs_fat_info("/sd", &fat_total, &fat_free) == ESP_OK)
+        df_print_row("sd", "/sd", fat_total, fat_free);
+    else {
+        Serial.printf("%-6s  not available\r\n", "sd");
+        notify_activity("sd", "df", "0, 0");
+    }
+#endif
+
+    return EXIT_SUCCESS;
+}
+
+#ifdef SD_CARD
+#ifndef DISABLE_LOCATEDB
+// ─── locate / updatedb ────────────────────────────────────────────────────────
+#include "sqlite3.h"
+#include "sqlite3_esp32.h"
+#include <string>
+#include <unordered_set>
+#include <vector>
+#include <ctime>
+
+#include "string_utils.h"
+
+#define LOCATE_DB_PATH "/sd/.locate"
+
+/* Volatile scan state — written by the scan task, read by locate/updatedb. */
+static volatile int    s_scan_running = 0;
+static volatile int    s_scan_stop    = 0;  // set to 1 to request cancellation
+
+// Exported so the console shells can cancel a scan that is occupying the
+// executor task — see the declaration in VFSCommands.h.
+bool updatedb_request_stop()
+{
+    if (!s_scan_running)
+        return false;
+    s_scan_stop = 1;
+    return true;
+}
+static volatile int    s_scan_resume  = 0;  // set to 1 to resume from existing DB
+static volatile int    s_scan_files   = 0;
+static volatile int    s_scan_dirs    = 0;
+static volatile int    s_scan_errors  = 0;
+static volatile time_t s_scan_start   = 0;
+static volatile time_t s_scan_end     = 0;
+static std::string     s_scan_last_folder;  // last completed directory path
+
+static void sqlite_one_time_init(void)
+{
+    static bool inited = false;
+    if (inited) return;
+    int psram = sqlite3_esp32_init();
+    Serial.printf("sqlite: pcache=%s\r\n", psram ? "PSRAM" : "DRAM(fallback)");
+    inited = true;
+}
+
+/* Directory path entry allocated from PSRAM.
+ * std::string's internal heap allocation for paths > ~15 chars lands in
+ * internal DRAM, which quickly exhausts the DMA-capable heap and breaks
+ * SDMMC reads at scale (57K+ files / 4K+ dirs).  Storing paths in PSRAM
+ * keeps internal DRAM free for the SDMMC DMA allocator. */
+struct PsramPath {
+    char *s = nullptr;
+    explicit PsramPath(const char *str) {
+        size_t n = strlen(str) + 1;
+        s = (char *)heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s) s = (char *)malloc(n);
+        if (s) memcpy(s, str, n);
+    }
+    ~PsramPath() { free(s); }
+    PsramPath(PsramPath &&o) noexcept : s(o.s) { o.s = nullptr; }
+    PsramPath(const PsramPath &) = delete;
+    PsramPath &operator=(const PsramPath &) = delete;
+};
+
+// dir_ins_stmt : INSERT OR IGNORE INTO dirs (path) VALUES (?)
+// dir_id_stmt  : SELECT id FROM dirs WHERE path = ?
+// file_ins_stmt: INSERT OR REPLACE INTO files (dir_id, name, size, mtime, is_dir) VALUES (?,?,?,?,?)
+// mark_stmt    : UPDATE dirs SET scanned=1 WHERE path=?
+static void updatedb_scan(sqlite3 *db,
+                           sqlite3_stmt *dir_ins_stmt,
+                           sqlite3_stmt *dir_id_stmt,
+                           sqlite3_stmt *file_ins_stmt,
+                           sqlite3_stmt *mark_stmt,
+                           std::vector<PsramPath> dirs,
+                           const std::unordered_set<std::string>& skip_dirs)
+{
+    char full[PATH_MAX];
+    int  batch = 0;
+
+    auto mark_scanned = [&](const char *rel) {
+        sqlite3_reset(mark_stmt);
+        sqlite3_bind_text(mark_stmt, 1, rel, -1, SQLITE_STATIC);
+        sqlite3_step(mark_stmt);
+    };
+
+    // Ensure a directory exists in `dirs` and return its id.
+    auto get_or_create_dir = [&](const char *rel) -> sqlite3_int64 {
+        sqlite3_reset(dir_ins_stmt);
+        sqlite3_bind_text(dir_ins_stmt, 1, rel, -1, SQLITE_STATIC);
+        sqlite3_step(dir_ins_stmt);
+        sqlite3_reset(dir_id_stmt);
+        sqlite3_bind_text(dir_id_stmt, 1, rel, -1, SQLITE_STATIC);
+        sqlite3_int64 id = 0;
+        if (sqlite3_step(dir_id_stmt) == SQLITE_ROW)
+            id = sqlite3_column_int64(dir_id_stmt, 0);
+        return id;
+    };
+
+    while (!dirs.empty() && !s_scan_stop) {
+        PsramPath cur(std::move(dirs.back()));
+        dirs.pop_back();
+        if (!cur.s) continue;
+
+        const char *cur_rel = cur.s + 3;   // relative to /sd, e.g. "" for root, "/games" for subdir
+        sqlite3_int64 cur_dir_id = get_or_create_dir(cur_rel);
+
+        DIR *d = opendir(cur.s);
+        if (!d) {
+            mark_scanned(cur_rel);
+            continue;
+        }
+
+        struct dirent *ent;
+        while (!s_scan_stop && (ent = readdir(d)) != nullptr) {
+            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+                continue;
+            if (strcmp(cur.s, "/sd") == 0 && strcmp(ent->d_name, ".locate") == 0)
+                continue;
+
+            snprintf(full, sizeof(full), "%s/%s", cur.s, ent->d_name);
+
+            if (mstr::isJunk(ent->d_name)) {
+                if (remove(full) == 0)
+                    Serial.printf("  deleted: %s\r\n", full);
+                continue;
+            }
+
+            struct stat st;
+            if (stat(full, &st) != 0) continue;
+
+            int is_dir = S_ISDIR(st.st_mode) ? 1 : 0;
+
+            sqlite3_reset(file_ins_stmt);
+            sqlite3_bind_int64(file_ins_stmt, 1, cur_dir_id);
+            sqlite3_bind_text(file_ins_stmt, 2, ent->d_name, -1, SQLITE_STATIC);
+            sqlite3_bind_int64(file_ins_stmt, 3, (sqlite3_int64)st.st_size);
+            sqlite3_bind_int64(file_ins_stmt, 4, (sqlite3_int64)st.st_mtime);
+            sqlite3_bind_int(file_ins_stmt, 5, is_dir);
+            int rc = sqlite3_step(file_ins_stmt);
+            if (rc != SQLITE_DONE) {
+                s_scan_errors = s_scan_errors + 1;
+                if (s_scan_errors <= 3)
+                    Serial.printf("  insert error %d: %s — %s/%s\r\n",
+                                  rc, sqlite3_errmsg(db), cur_rel, ent->d_name);
+            }
+
+            if (is_dir) {
+                s_scan_dirs = s_scan_dirs + 1;
+                const char *sub_rel = full + 3;
+                get_or_create_dir(sub_rel);  // ensure dirs row exists for resume tracking
+                if (skip_dirs.count(sub_rel))
+                    mark_scanned(sub_rel);
+                else
+                    dirs.emplace_back(full);
+            } else {
+                s_scan_files = s_scan_files + 1;
+            }
+
+            if (++batch >= 1000) {
+                if (!sqlite3_get_autocommit(db)) {
+                    char *cerr = nullptr;
+                    if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, &cerr) != SQLITE_OK) {
+                        Serial.printf("  commit failed: %s\r\n",
+                                      cerr ? cerr : sqlite3_errmsg(db));
+                        sqlite3_free(cerr);
+                    }
+                }
+                char *berr = nullptr;
+                if (sqlite3_exec(db, "BEGIN", nullptr, nullptr, &berr) != SQLITE_OK) {
+                    Serial.printf("  BEGIN failed: %s\r\n",
+                                  berr ? berr : sqlite3_errmsg(db));
+                    sqlite3_free(berr);
+                }
+                batch = 0;
+            }
+
+            int total = s_scan_files + s_scan_dirs;
+            if (total % 100 == 0)
+                Serial.printf("  %d dirs, %d files\r\n",
+                              (int)s_scan_dirs, (int)s_scan_files);
+
+                // Serial.printf("  %d dirs, %d files — free=%lu dma_max=%lu\r\n",
+                //               (int)s_scan_dirs, (int)s_scan_files,
+                //               esp_get_free_internal_heap_size(),
+                //               (unsigned long)heap_caps_get_largest_free_block(
+                //                   MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+        }
+        closedir(d);
+        mark_scanned(cur_rel);
+        s_scan_last_folder = cur_rel;
+        vTaskDelay(1);
+    }
+}
+
+// DELETE journal (the SQLite default) writes the rollback journal to SD and
+// deletes it on each COMMIT.  This properly resets the pager's internal
+// state on every COMMIT/BEGIN cycle, fixing the "cannot commit - no
+// transaction is active" error that journal_mode=OFF has after 2+ cycles
+// with SQLITE_DEFAULT_LOCKING_MODE=1 (EXCLUSIVE).
+// MEMORY journal was tried but rejected: it allocates ~520-byte entries in
+// internal DRAM (below SPIRAM_MALLOC_ALWAYSINTERNAL threshold), exhausting
+// the DMA-capable heap and breaking SDMMC writes at row ~300.
+static void apply_pragmas(sqlite3 *d)
+{
+    sqlite3_exec(d, "PRAGMA journal_mode = DELETE", nullptr, nullptr, nullptr);
+    sqlite3_exec(d, "PRAGMA synchronous = OFF",     nullptr, nullptr, nullptr);
+    // 128 pages from the pre-allocated PSRAM slab (see sqlite3_esp32_init).
+    sqlite3_exec(d, "PRAGMA cache_size = 128",      nullptr, nullptr, nullptr);
+}
+
+static void updatedb_compress_gz(void);
+
+// Rebuild the FTS5 index from the existing files+dirs tables.
+// Swaps SQLite to the PSRAM allocator for the duration so FTS5's token hash
+// doesn't exhaust internal DRAM (see sqlite3_esp32_psram_malloc_enter).
+// Prints progress every 100 rows.  Safe to call from any FreeRTOS task.
+static void updatedb_fts_rebuild(void)
+{
+    sqlite_one_time_init();
+    sqlite3_esp32_psram_malloc_enter();
+
+    sqlite3 *db = nullptr;
+    if (sqlite3_open_v2(LOCATE_DB_PATH, &db, SQLITE_OPEN_READWRITE, nullptr) != SQLITE_OK) {
+        Serial.printf("updatedb fts: open failed: %s\r\n", sqlite3_errmsg(db));
+        if (db) sqlite3_close(db);
+        sqlite3_esp32_psram_malloc_exit();
+        return;
+    }
+    apply_pragmas(db);
+
+    int fts_total = 0;
+    {
+        sqlite3_stmt *cnt = nullptr;
+        if (sqlite3_prepare_v2(db, "SELECT count(*) FROM files", -1, &cnt, nullptr) == SQLITE_OK
+                && sqlite3_step(cnt) == SQLITE_ROW)
+            fts_total = sqlite3_column_int(cnt, 0);
+        sqlite3_finalize(cnt);
+    }
+
+    if (fts_total == 0) {
+        Serial.printf("updatedb fts: no files in database — run 'updatedb start' first\r\n");
+        sqlite3_close(db);
+        sqlite3_esp32_psram_malloc_exit();
+        return;
+    }
+
+    Serial.printf("updatedb: clearing FTS index...\r\n");
+    sqlite3_exec(db, "INSERT INTO files_fts(files_fts) VALUES('delete-all')",
+                 nullptr, nullptr, nullptr);
+    Serial.printf("updatedb: building FTS index (%d rows)...\r\n", fts_total);
+
+    sqlite3_stmt *sel_stmt = nullptr;
+    sqlite3_stmt *ins_stmt = nullptr;
+    sqlite3_prepare_v2(db,
+        "SELECT files.id, dirs.path || '/' || files.name"
+        " FROM files JOIN dirs ON dirs.id = files.dir_id"
+        " ORDER BY files.id",
+        -1, &sel_stmt, nullptr);
+    sqlite3_prepare_v2(db,
+        "INSERT INTO files_fts(rowid, path) VALUES(?, ?)",
+        -1, &ins_stmt, nullptr);
+
+    int fts_done = 0;
+    time_t fts_start = time(nullptr);
+    sqlite3_exec(db, "BEGIN", nullptr, nullptr, nullptr);
+
+    while (sqlite3_step(sel_stmt) == SQLITE_ROW) {
+        sqlite3_reset(ins_stmt);
+        sqlite3_bind_int64(ins_stmt, 1, sqlite3_column_int64(sel_stmt, 0));
+        sqlite3_bind_text(ins_stmt, 2,
+            (const char *)sqlite3_column_text(sel_stmt, 1), -1, SQLITE_STATIC);
+        sqlite3_step(ins_stmt);
+
+        if (++fts_done % 100 == 0) {
+            int pct = fts_total > 0 ? fts_done * 100 / fts_total : 0;
+            Serial.printf("  %d / %d  (%d%%)  %s\r\n",
+                          fts_done, fts_total, pct,
+                          mstr::formatDuration((long)(time(nullptr) - fts_start)).c_str());
+            sqlite3_exec(db, "COMMIT;BEGIN", nullptr, nullptr, nullptr);
+            vTaskDelay(1);
+        }
+    }
+    sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr);
+    sqlite3_finalize(sel_stmt);
+    sqlite3_finalize(ins_stmt);
+
+    Serial.printf("  %d rows indexed in %s.\r\n",
+                  fts_done, mstr::formatDuration((long)(time(nullptr) - fts_start)).c_str());
+
+    sqlite3_close(db);
+    sqlite3_esp32_psram_malloc_exit();
+    updatedb_compress_gz();
+}
+
+static void updatedb_compress_gz(void)
+{
+    struct stat st = {};
+    size_t total = (stat(LOCATE_DB_PATH, &st) == 0) ? (size_t)st.st_size : 0;
+    Serial.printf("updatedb: compressing to %s.gz (%zu bytes)...\r\n", LOCATE_DB_PATH, total);
+
+    FILE *in = fopen(LOCATE_DB_PATH, "rb");
+    if (!in) {
+        Serial.printf("updatedb compress: cannot open %s\r\n", LOCATE_DB_PATH);
+        return;
+    }
+
+    gzFile gz = gzopen(LOCATE_DB_PATH ".gz", "wb9");
+    if (!gz) {
+        Serial.printf("updatedb compress: cannot create %s.gz\r\n", LOCATE_DB_PATH);
+        fclose(in);
+        return;
+    }
+
+    const size_t kBufSz = 32768;
+    char *buf = (char *)psram_malloc(kBufSz);
+    if (!buf) {
+        Serial.printf("updatedb compress: out of memory\r\n");
+        gzclose(gz);
+        fclose(in);
+        return;
+    }
+
+    size_t written = 0, last_report = 0;
+    const size_t kReport = 512 * 1024;
+    size_t n;
+    while ((n = fread(buf, 1, kBufSz, in)) > 0) {
+        gzwrite(gz, buf, (unsigned)n);
+        written += n;
+        if (total > 0 && written - last_report >= kReport) {
+            Serial.printf("  %zu / %zu bytes (%d%%)\r\n",
+                          written, total, (int)(written * 100 / total));
+            last_report = written;
+            vTaskDelay(1);
+        }
+    }
+
+    free(buf);
+    gzclose(gz);
+    fclose(in);
+    if (total > 0 && last_report < written)
+        Serial.printf("  %zu / %zu bytes (100%%)\r\n", written, total);
+    Serial.printf("updatedb: %s.gz written\r\n", LOCATE_DB_PATH);
+}
+
+static void updatedb_fts_run(void)
+{
+    updatedb_fts_rebuild();
+    s_scan_running = 0;
+
+}
+
+// Runs on the CALLING task. Console commands already execute on console_exec,
+// which has a 16 KB internal stack, so this used to spawn a second 8 KB task
+// for no benefit - and task stacks are internal-DRAM only, with no PSRAM
+// fallback. Claiming that block ON DEMAND is what left the lazily-started web
+// server unable to find a contiguous stack (ESP_ERR_HTTPD_TASK reporting
+// free_internal=17116 but largest_internal_block=8180 - fragmentation, not
+// exhaustion), which is the failure mode AGENTS.md warns about for on-demand
+// task creation.
+//
+// The trade is that the console blocks for the whole scan. "updatedb stop" is
+// intercepted shell-side in Console.cpp so cancelling still works, the same way
+// "exit" and "reboot" are - the scan polls s_scan_stop and yields once per
+// directory, so the REPL keeps reading input.
+static void updatedb_run(void)
+{
+    // SQLITE_OMIT_AUTOINIT: must init before sqlite3_open().
+    sqlite_one_time_init();
+
+    // Swap SQLite to the PSRAM allocator for the whole scan, for the same
+    // reason updatedb_fts_rebuild() does it (see sqlite3_esp32.h): FTS5's
+    // token hash is thousands of sub-512-byte allocations, and
+    // CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=512 puts every one of them in
+    // internal DRAM. That starves the DMA-capable heap, and the SDMMC driver
+    // needs a 512-byte MALLOC_CAP_DMA bounce buffer for EVERY sector it
+    // writes (sdmmc_cmd.c, sdmmc_write_sectors). Creating the files_fts
+    // shadow tables was failing with ESP_ERR_NO_MEM for exactly that reason -
+    // the rebuild path was protected, this one was not.
+    // enter/exit are stateless swaps of the allocator saved at init, so the
+    // nested enter inside updatedb_fts_rebuild() below is harmless.
+    sqlite3_esp32_psram_malloc_enter();
+
+    sqlite3      *db            = nullptr;
+    sqlite3_stmt *dir_ins_stmt  = nullptr;   // INSERT OR IGNORE INTO dirs (path)
+    sqlite3_stmt *dir_id_stmt   = nullptr;   // SELECT id FROM dirs WHERE path=?
+    sqlite3_stmt *file_ins_stmt = nullptr;   // INSERT OR REPLACE INTO files (dir_id,name,...)
+    sqlite3_stmt *mark_stmt     = nullptr;   // UPDATE dirs SET scanned=1 WHERE path=?
+    std::vector<PsramPath>          initial_dirs;
+    std::unordered_set<std::string> skip_dirs;
+
+    if (!s_scan_resume) {
+        // ── Fresh scan ────────────────────────────────────────────────────────
+        // Remove any stale/corrupt database from a previous interrupted scan.
+        unlink(LOCATE_DB_PATH);
+        unlink(LOCATE_DB_PATH ".gz");
+
+        if (sqlite3_open(LOCATE_DB_PATH, &db) != SQLITE_OK) {
+            Serial.printf("updatedb: cannot create database: %s\r\n",
+                          db ? sqlite3_errmsg(db) : "out of memory");
+            if (db) sqlite3_close(db);
+            s_scan_running = 0;
+            sqlite3_esp32_psram_malloc_exit();
+            return;
+        }
+
+        Serial.printf("updatedb: db open — free=%lu dma_max=%lu\r\n",
+                      esp_get_free_internal_heap_size(),
+                      (unsigned long)heap_caps_get_largest_free_block(
+                          MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+
+        apply_pragmas(db);
+
+        const char *schema =
+            "DROP TABLE IF EXISTS files_fts;"
+            "DROP TABLE IF EXISTS files;"
+            "DROP TABLE IF EXISTS dirs;"
+            // dirs: one row per unique directory path; scanned=1 once all children are indexed.
+            "CREATE TABLE dirs ("
+            "  id      INTEGER PRIMARY KEY,"
+            "  path    TEXT    NOT NULL UNIQUE,"
+            "  scanned INTEGER NOT NULL DEFAULT 0"
+            ");"
+            // files: every entry (file or subdir) stored under its parent dir_id.
+            // UNIQUE(dir_id,name) lets INSERT OR REPLACE handle re-scans cleanly.
+            "CREATE TABLE files ("
+            "  id      INTEGER PRIMARY KEY,"
+            "  dir_id  INTEGER NOT NULL,"
+            "  name    TEXT    NOT NULL,"
+            "  size    INTEGER NOT NULL DEFAULT 0,"
+            "  mtime   INTEGER NOT NULL DEFAULT 0,"
+            "  is_dir  INTEGER NOT NULL DEFAULT 0,"
+            "  UNIQUE(dir_id, name)"
+            ");"
+            "CREATE INDEX files_dir_idx ON files(dir_id);"
+            // FTS5 with content='' stores only the inverted token index, not the
+            // original text — the full path is reconstructed via JOIN at query time.
+            "CREATE VIRTUAL TABLE files_fts USING fts5("
+            "  path, content='', tokenize=\"unicode61\""
+            ");"
+            "CREATE TABLE status ("
+            "  id          INTEGER PRIMARY KEY DEFAULT 1,"
+            "  total_dirs  INTEGER NOT NULL DEFAULT 0,"
+            "  total_files INTEGER NOT NULL DEFAULT 0,"
+            "  last_scan   INTEGER NOT NULL DEFAULT 0,"
+            "  duration    INTEGER NOT NULL DEFAULT 0,"
+            "  last_folder TEXT    NOT NULL DEFAULT ''"
+            ");";
+
+        char *errmsg = nullptr;
+        if (sqlite3_exec(db, schema, nullptr, nullptr, &errmsg) != SQLITE_OK) {
+            Serial.printf("updatedb: %s\r\n", errmsg);
+            sqlite3_free(errmsg);
+            sqlite3_close(db);
+            s_scan_running = 0;
+            sqlite3_esp32_psram_malloc_exit();
+            return;
+        }
+
+        initial_dirs.emplace_back("/sd");
+
+    } else {
+        // ── Resume scan ───────────────────────────────────────────────────────
+        if (sqlite3_open(LOCATE_DB_PATH, &db) != SQLITE_OK) {
+            Serial.printf("updatedb: cannot open database for resume: %s\r\n",
+                          db ? sqlite3_errmsg(db) : "out of memory");
+            if (db) sqlite3_close(db);
+            s_scan_running = 0;
+            sqlite3_esp32_psram_malloc_exit();
+            return;
+        }
+
+        apply_pragmas(db);
+
+        // Detect old single-table schema (no `dirs` table).
+        {
+            sqlite3_stmt *chk = nullptr;
+            bool has_dirs = (sqlite3_prepare_v2(db, "SELECT id FROM dirs LIMIT 1",
+                                                -1, &chk, nullptr) == SQLITE_OK);
+            sqlite3_finalize(chk);
+            if (!has_dirs) {
+                Serial.printf("updatedb: schema outdated — run 'updatedb start' to rebuild.\r\n");
+                sqlite3_close(db);
+                s_scan_running = 0;
+                sqlite3_esp32_psram_malloc_exit();
+                return;
+            }
+        }
+
+        // Migrate: add status table if absent.
+        sqlite3_exec(db,
+            "CREATE TABLE IF NOT EXISTS status ("
+            "  id INTEGER PRIMARY KEY DEFAULT 1,"
+            "  total_files INTEGER NOT NULL DEFAULT 0,"
+            "  total_dirs  INTEGER NOT NULL DEFAULT 0,"
+            "  last_scan   INTEGER NOT NULL DEFAULT 0,"
+            "  duration    INTEGER NOT NULL DEFAULT 0,"
+            "  last_folder TEXT    NOT NULL DEFAULT ''"
+            ")",
+            nullptr, nullptr, nullptr);
+
+        // Load fully-scanned directories so we don't re-process them.
+        {
+            sqlite3_stmt *q = nullptr;
+            if (sqlite3_prepare_v2(db,
+                    "SELECT path FROM dirs WHERE scanned=1",
+                    -1, &q, nullptr) == SQLITE_OK) {
+                while (sqlite3_step(q) == SQLITE_ROW) {
+                    const char *p = (const char *)sqlite3_column_text(q, 0);
+                    if (p) skip_dirs.insert(p);
+                }
+                sqlite3_finalize(q);
+            }
+        }
+
+        // Always re-scan /sd root so any root-level entries missing from the DB are picked up.
+        initial_dirs.emplace_back("/sd");
+
+        // Seed with directories that were discovered but not yet fully scanned.
+        {
+            sqlite3_stmt *q = nullptr;
+            if (sqlite3_prepare_v2(db,
+                    "SELECT path FROM dirs WHERE scanned=0",
+                    -1, &q, nullptr) == SQLITE_OK) {
+                while (sqlite3_step(q) == SQLITE_ROW) {
+                    const char *p = (const char *)sqlite3_column_text(q, 0);
+                    if (p && p[0] != '\0') {
+                        std::string full = "/sd";
+                        full += p;
+                        initial_dirs.emplace_back(full.c_str());
+                    }
+                }
+                sqlite3_finalize(q);
+            }
+        }
+
+        Serial.printf("updatedb: resuming — %zu pending dirs, %zu already scanned\r\n",
+                      initial_dirs.size(), skip_dirs.size());
+    }
+
+    // Prepare the four statements used by updatedb_scan.
+    auto prep_fail = [&](const char *label) {
+        Serial.printf("updatedb: prepare %s failed: %s\r\n", label, sqlite3_errmsg(db));
+        sqlite3_finalize(dir_ins_stmt);
+        sqlite3_finalize(dir_id_stmt);
+        sqlite3_finalize(file_ins_stmt);
+        sqlite3_finalize(mark_stmt);
+        sqlite3_close(db);
+        s_scan_running = 0;
+        sqlite3_esp32_psram_malloc_exit();
+        return;
+    };
+
+    if (sqlite3_prepare_v2(db,
+            "INSERT OR IGNORE INTO dirs (path) VALUES (?)",
+            -1, &dir_ins_stmt, nullptr) != SQLITE_OK) { prep_fail("dir_ins"); return; }
+
+    if (sqlite3_prepare_v2(db,
+            "SELECT id FROM dirs WHERE path=?",
+            -1, &dir_id_stmt, nullptr) != SQLITE_OK) { prep_fail("dir_id"); return; }
+
+    if (sqlite3_prepare_v2(db,
+            "INSERT OR REPLACE INTO files (dir_id, name, size, mtime, is_dir)"
+            " VALUES (?, ?, ?, ?, ?)",
+            -1, &file_ins_stmt, nullptr) != SQLITE_OK) { prep_fail("file_ins"); return; }
+
+    if (sqlite3_prepare_v2(db,
+            "UPDATE dirs SET scanned=1 WHERE path=?",
+            -1, &mark_stmt, nullptr) != SQLITE_OK) { prep_fail("mark"); return; }
+
+    s_scan_errors = 0;
+    char *begin_err = nullptr;
+    if (sqlite3_exec(db, "BEGIN", nullptr, nullptr, &begin_err) != SQLITE_OK) {
+        Serial.printf("updatedb: initial BEGIN failed: %s\r\n",
+                      begin_err ? begin_err : sqlite3_errmsg(db));
+        sqlite3_free(begin_err);
+    }
+    updatedb_scan(db, dir_ins_stmt, dir_id_stmt, file_ins_stmt, mark_stmt,
+                  std::move(initial_dirs), skip_dirs);
+
+    // Commit whatever the last partial batch left in-transaction.
+    if (!sqlite3_get_autocommit(db)) {
+        char *commit_err = nullptr;
+        if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, &commit_err) != SQLITE_OK) {
+            Serial.printf("updatedb: final COMMIT failed: %s\r\n",
+                          commit_err ? commit_err : sqlite3_errmsg(db));
+            sqlite3_free(commit_err);
+        }
+    }
+
+    sqlite3_finalize(dir_ins_stmt);
+    sqlite3_finalize(dir_id_stmt);
+    sqlite3_finalize(file_ins_stmt);
+    sqlite3_finalize(mark_stmt);
+    sqlite3_close(db);   /* must close before fts_rebuild calls sqlite3_shutdown() */
+    db = nullptr;
+
+    if (!s_scan_stop)
+        updatedb_fts_rebuild();
+
+    s_scan_end = time(nullptr);
+
+    // Persist scan statistics so 'updatedb' (no args) can display them later.
+    {
+        sqlite3 *sdb = nullptr;
+        if (sqlite3_open_v2(LOCATE_DB_PATH, &sdb, SQLITE_OPEN_READWRITE, nullptr) == SQLITE_OK) {
+            apply_pragmas(sdb);
+            sqlite3_stmt *ss = nullptr;
+            const char *status_sql =
+                "INSERT OR REPLACE INTO status"
+                " (id, total_dirs, total_files, last_scan, duration, last_folder)"
+                " VALUES (1, ?, ?, ?, ?, ?)";
+            if (sqlite3_prepare_v2(sdb, status_sql, -1, &ss, nullptr) == SQLITE_OK) {
+                sqlite3_bind_int(ss,   1, (int)s_scan_dirs);
+                sqlite3_bind_int(ss,   2, (int)s_scan_files);
+                sqlite3_bind_int64(ss, 3, (sqlite3_int64)s_scan_end);
+                sqlite3_bind_int64(ss, 4, (sqlite3_int64)(s_scan_end - s_scan_start));
+                sqlite3_bind_text(ss,  5, s_scan_last_folder.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_step(ss);
+                sqlite3_finalize(ss);
+            }
+            sqlite3_close(sdb);
+        }
+    }
+
+    s_scan_resume  = 0;
+    s_scan_running = 0;
+
+    if (s_scan_stop)
+        Serial.printf("updatedb: stopped — %d directories, %d files, last folder: %s\r\n",
+                      (int)s_scan_dirs, (int)s_scan_files, s_scan_last_folder.c_str());
+    else
+        Serial.printf("updatedb: done — %d directories, %d files, %d errors, %s.\r\n",
+                      (int)s_scan_dirs, (int)s_scan_files,
+                      (int)s_scan_errors, mstr::formatDuration(s_scan_end - s_scan_start).c_str());
+
+    // Restore explicitly rather than relying on updatedb_fts_rebuild() having
+    // done it: leaving SQLite on the PSRAM allocator would be a system-wide
+    // change made by a task that has finished. exit() is a stateless restore of
+    // the allocator saved at init, so calling it twice costs nothing.
+    sqlite3_esp32_psram_malloc_exit();
+    return;
+}
+
+int updatedb(int argc, char **argv)
+{
+    // -- updatedb status -- persistent status read back from the database ----
+    if (argc > 1 && strcmp(argv[1], "status") == 0) {
+        if (s_scan_running) {
+            time_t elapsed = time(nullptr) - s_scan_start;
+            Serial.printf("Scan in progress: %d directories, %d files (%s elapsed)\r\n",
+                          (int)s_scan_dirs, (int)s_scan_files, mstr::formatDuration(elapsed).c_str());
+            if (!s_scan_last_folder.empty())
+                Serial.printf("Last folder:      /sd%s\r\n", s_scan_last_folder.c_str());
+            return EXIT_SUCCESS;
+        }
+        if (!fnSDFAT.running()) {
+            Serial.printf("updatedb: SD card not mounted\r\n");
+            return EXIT_FAILURE;
+        }
+        sqlite_one_time_init();
+        sqlite3 *db = nullptr;
+        if (sqlite3_open_v2(LOCATE_DB_PATH, &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
+            Serial.printf("No index found. Run 'updatedb start' to build the database.\r\n");
+            if (db) sqlite3_close(db);
+            return EXIT_SUCCESS;
+        }
+        sqlite3_stmt *stmt = nullptr;
+        if (sqlite3_prepare_v2(db,
+                "SELECT total_dirs, total_files, last_scan, duration, last_folder"
+                " FROM status WHERE id=1",
+                -1, &stmt, nullptr) == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW) {
+            int    total_dirs   = sqlite3_column_int(stmt, 0);
+            int    total_files  = sqlite3_column_int(stmt, 1);
+            time_t last_scan    = (time_t)sqlite3_column_int64(stmt, 2);
+            int    duration     = sqlite3_column_int(stmt, 3);
+            const char *folder  = (const char *)sqlite3_column_text(stmt, 4);
+            char tbuf[32] = "unknown";
+            struct tm *ti = localtime(&last_scan);
+            if (ti) strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", ti);
+            Serial.printf("Last scan:    %s (%s)\r\n", tbuf, mstr::formatDuration(duration).c_str());
+            Serial.printf("Index:       %d directories, %d files\r\n", total_dirs, total_files);
+            if (folder && folder[0])
+                Serial.printf("Last folder:  /sd%s\r\n", folder);
+        } else {
+            Serial.printf("No scan data. Run 'updatedb start' to build the database.\r\n");
+        }
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return EXIT_SUCCESS;
+    }
+
+    // ── updatedb stop ─────────────────────────────────────────────────────────
+    if (argc > 1 && strcmp(argv[1], "stop") == 0) {
+        if (!s_scan_running) {
+            Serial.printf("updatedb: no scan in progress\r\n");
+            return EXIT_FAILURE;
+        }
+        s_scan_stop = 1;
+        Serial.printf("updatedb: stop requested\r\n");
+        return EXIT_SUCCESS;
+    }
+
+    // ── updatedb resume ───────────────────────────────────────────────────────
+    if (argc > 1 && strcmp(argv[1], "resume") == 0) {
+        if (!fnSDFAT.running()) {
+            Serial.printf("updatedb: SD card not mounted\r\n");
+            return EXIT_FAILURE;
+        }
+        if (s_scan_running) {
+            Serial.printf("updatedb: scan already in progress (%d directories, %d files so far)\r\n",
+                          (int)s_scan_dirs, (int)s_scan_files);
+            return EXIT_FAILURE;
+        }
+        struct stat dbst;
+        if (stat(LOCATE_DB_PATH, &dbst) != 0) {
+            Serial.printf("updatedb: no database to resume — run 'updatedb start' first\r\n");
+            return EXIT_FAILURE;
+        }
+        s_scan_files        = 0;
+        s_scan_dirs         = 0;
+        s_scan_errors       = 0;
+        s_scan_stop         = 0;
+        s_scan_resume       = 1;
+        s_scan_start        = time(nullptr);
+        s_scan_end          = 0;
+        s_scan_last_folder  = "";
+        s_scan_running      = 1;
+        Serial.printf("Resuming locate database scan (console blocked; 'updatedb stop' to cancel)...\r\n");
+        updatedb_run();   // on console_exec's stack - see the comment above
+        return EXIT_SUCCESS;
+    }
+
+    // ── updatedb start ────────────────────────────────────────────────────────
+    // Bare "updatedb" scans, same as "updatedb start" - the common case does
+    // not need a subcommand. Status moved to "updatedb status" above.
+    if (argc < 2 || strcmp(argv[1], "start") == 0) {
+        if (!fnSDFAT.running()) {
+            Serial.printf("updatedb: SD card not mounted\r\n");
+            return EXIT_FAILURE;
+        }
+        if (s_scan_running) {
+            Serial.printf("updatedb: scan already in progress (%d directories, %d files so far)\r\n",
+                          (int)s_scan_dirs, (int)s_scan_files);
+            return EXIT_FAILURE;
+        }
+        s_scan_files        = 0;
+        s_scan_dirs         = 0;
+        s_scan_errors       = 0;
+        s_scan_stop         = 0;
+        s_scan_resume       = 0;
+        s_scan_start        = time(nullptr);
+        s_scan_end          = 0;
+        s_scan_last_folder  = "";
+        s_scan_running      = 1;
+        Serial.printf("Building locate database (console blocked; 'updatedb stop' to cancel)...\r\n");
+        updatedb_run();   // on console_exec's stack - see the comment above
+        return EXIT_SUCCESS;
+    }
+
+    // ── updatedb fts ─────────────────────────────────────────────────────────
+    if (argc > 1 && strcmp(argv[1], "fts") == 0) {
+        if (!fnSDFAT.running()) {
+            Serial.printf("updatedb: SD card not mounted\r\n");
+            return EXIT_FAILURE;
+        }
+        if (s_scan_running) {
+            Serial.printf("updatedb: scan already in progress — wait for it to finish\r\n");
+            return EXIT_FAILURE;
+        }
+        struct stat dbst;
+        if (stat(LOCATE_DB_PATH, &dbst) != 0) {
+            Serial.printf("updatedb: no database — run 'updatedb start' first\r\n");
+            return EXIT_FAILURE;
+        }
+        s_scan_running = 1;
+        Serial.printf("Rebuilding FTS index (console blocked)...\r\n");
+        updatedb_fts_run();   // on console_exec's stack - see the comment above
+        return EXIT_SUCCESS;
+    }
+
+    Serial.printf("Usage: updatedb [start|status|stop|resume|fts]  (no argument = start)\r\n");
+    return EXIT_FAILURE;
+}
+
+int locate(int argc, char **argv)
+{
+    if (argc < 2) {
+        if (s_scan_running) {
+            time_t elapsed = time(nullptr) - s_scan_start;
+            Serial.printf("Scan in progress: %d directories, %d files indexed (%s elapsed)\r\n",
+                          (int)s_scan_dirs, (int)s_scan_files, mstr::formatDuration(elapsed).c_str());
+        } else if (s_scan_end > 0) {
+            Serial.printf("Last scan: %d directories, %d files in %s\r\n",
+                          (int)s_scan_dirs, (int)s_scan_files,
+                          mstr::formatDuration(s_scan_end - s_scan_start).c_str());
+        } else {
+            /* No scan this session — query the database for persisted totals. */
+            if (!fnSDFAT.running()) {
+                Serial.printf("locate: SD card not mounted\r\n");
+                return EXIT_FAILURE;
+            }
+            sqlite_one_time_init();
+            sqlite3 *db = nullptr;
+            if (sqlite3_open_v2(LOCATE_DB_PATH, &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
+                Serial.printf("No index found. Run 'updatedb start' to build the database.\r\n");
+                if (db) sqlite3_close(db);
+                return EXIT_SUCCESS;
+            }
+            sqlite3_stmt *stmt = nullptr;
+            int files = 0, dirs = 0;
+            if (sqlite3_prepare_v2(db,
+                    "SELECT SUM(is_dir=0), SUM(is_dir=1) FROM files",
+                    -1, &stmt, nullptr) == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW) {
+                files = sqlite3_column_int(stmt, 0);
+                dirs  = sqlite3_column_int(stmt, 1);
+            }
+            sqlite3_finalize(stmt);
+            sqlite3_close(db);
+            Serial.printf("Index contains %d directories, %d files. Run 'updatedb start' to refresh.\r\n",
+                          dirs, files);
+        }
+        return EXIT_SUCCESS;
+    }
+
+    if (!fnSDFAT.running()) {
+        Serial.printf("locate: SD card not mounted\r\n");
+        return EXIT_FAILURE;
+    }
+    if (s_scan_running) {
+        Serial.printf("locate: scan in progress, please wait.\r\n");
+        return EXIT_FAILURE;
+    }
+
+    sqlite_one_time_init();  // SQLITE_OMIT_AUTOINIT: required before sqlite3_open
+
+    sqlite3 *db = nullptr;
+    if (sqlite3_open_v2(LOCATE_DB_PATH, &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
+        Serial.printf("locate: database not found. Run 'updatedb' first.\r\n");
+        if (db) sqlite3_close(db);
+        return EXIT_FAILURE;
+    }
+
+    const char *arg = argv[1];
+    size_t arg_len = strlen(arg);
+
+    // FTS5 only handles trailing-* prefix queries.  Leading wildcards (*foo,
+    // ?foo), mid-string * (f*o), or any ? are invalid FTS5 syntax — skip FTS
+    // and go straight to LIKE for those patterns.
+    bool leading_wild = (arg[0] == '*' || arg[0] == '?');
+    bool has_question = (strchr(arg, '?') != nullptr);
+    bool mid_star = false;
+    for (size_t i = 0; i + 1 < arg_len; i++)
+        if (arg[i] == '*') { mid_star = true; break; }
+    bool use_fts = !leading_wild && !has_question && !mid_star;
+
+    // Build FTS5 pattern: bare words get a trailing * for prefix match.
+    std::string fts_pattern(arg);
+    if (use_fts && !strchr(arg, '*') && !strchr(arg, '"'))
+        fts_pattern += "*";
+
+    // Build LIKE pattern: convert glob wildcards, wrap bare words in %.
+    bool has_wildcards = strchr(arg, '*') || strchr(arg, '?');
+    std::string like_pattern(arg);
+    for (char &c : like_pattern) {
+        if (c == '*') c = '%';
+        else if (c == '?') c = '_';
+    }
+    if (!has_wildcards) like_pattern = "%" + like_pattern + "%";
+
+    const char *fts_sql =
+        "SELECT dirs.path || '/' || files.name, files.size, files.is_dir"
+        " FROM files JOIN dirs ON dirs.id = files.dir_id"
+        " WHERE files.id IN (SELECT rowid FROM files_fts WHERE files_fts MATCH ?)"
+        " ORDER BY dirs.path, files.name";
+    const char *like_sql =
+        "SELECT dirs.path || '/' || files.name, files.size, files.is_dir"
+        " FROM files JOIN dirs ON dirs.id = files.dir_id"
+        " WHERE dirs.path || '/' || files.name LIKE ?"
+        " ORDER BY dirs.path, files.name";
+
+    int count = 0;
+    sqlite3_stmt *stmt = nullptr;
+
+    auto drain = [&](sqlite3_stmt *s) {
+        while (sqlite3_step(s) == SQLITE_ROW) {
+            const char *p = (const char *)sqlite3_column_text(s, 0);
+            sqlite3_int64 sz = sqlite3_column_int64(s, 1);
+            int is_dir = sqlite3_column_int(s, 2);
+            if (p) Serial.printf("%c %8lld  /sd%s\r\n", is_dir ? 'd' : '-', (long long)sz, p);
+            count++;
+        }
+    };
+
+    // Try FTS5 first (only when pattern is FTS-compatible).
+    if (use_fts && sqlite3_prepare_v2(db, fts_sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, fts_pattern.c_str(), -1, SQLITE_TRANSIENT);
+        drain(stmt);
+        sqlite3_finalize(stmt);
+        stmt = nullptr;
+    }
+
+    // Fall back to LIKE if FTS was skipped, returned nothing, or wasn't available.
+    if (count == 0) {
+        if (sqlite3_prepare_v2(db, like_sql, -1, &stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, like_pattern.c_str(), -1, SQLITE_TRANSIENT);
+            drain(stmt);
+            sqlite3_finalize(stmt);
+        } else {
+            Serial.printf("locate: database schema outdated — run 'updatedb start' to rebuild.\r\n");
+            sqlite3_close(db);
+            return EXIT_FAILURE;
+        }
+    }
+
+    sqlite3_close(db);
+
+    if (count == 0)
+        Serial.printf("locate: no matches for '%s'\r\n", argv[1]);
+
+    return EXIT_SUCCESS;
+}
+// ─── end locate / updatedb ────────────────────────────────────────────────────
+#endif // !DISABLE_LOCATEDB
+
+static void format_sd_task(void *arg)
+{
+    Serial.printf("Formatting SD card (this may take several minutes)...\r\n");
+    if (fnSDFAT.format())
+    {
+        Serial.printf("SD card formatted successfully.\r\n");
+    }
+    else
+    {
+        Serial.printf("SD card format FAILED.\r\n");
+    }
+    vTaskDelete(NULL);
+}
+
+int format_sd(int argc, char **argv)
+{
+    if (argc < 2 || strcmp(argv[1], "-y") != 0)
+    {
+        Serial.printf("WARNING: This will erase all data on the SD card!\r\n");
+        Serial.printf("Usage: format_sd -y\r\n");
+        return EXIT_SUCCESS;
+    }
+
+    Serial.printf("Starting SD card format in background...\r\n");
+    xTaskCreate(format_sd_task, "format_sd", 4096, NULL, 5, NULL);
+
+    return EXIT_SUCCESS;
+}
+#endif
+
+// Resolve a console argument to an absolute VFS path using the current directory.
+static std::string resolve_path(const char *arg)
+{
+    if (arg[0] == '/') return arg;
+    // fullUrl(), not url: inside a container url is only the CONTAINER's
+    // path, with the position within it held in pathInStream. Using url
+    // alone resolves every relative name against the container root, so a
+    // path inside a subdirectory silently points somewhere else.
+    std::string pwd = getCurrentPath()->fullUrl();
+
+    // If this is a new url then use it
+    if ( mstr::contains(arg, "://") )
+    {
+        return arg;
+    }
+
+    if (arg[0] == '.' && arg[1] == '\0') return pwd;
+    return pwd + '/' + arg;
+}
+
+#ifndef MIN_CONFIG
+// ─── gzip ─────────────────────────────────────────────────────────────────────
+static int cmd_gzip(int argc, char **argv)
+{
+    if (argc < 2) {
+        Serial.printf("usage: gzip <source> [dest.gz]\r\n");
+        return EXIT_FAILURE;
+    }
+
+    std::string src = resolve_path(argv[1]);
+    std::string dst = (argc >= 3) ? resolve_path(argv[2]) : (src + ".gz");
+
+    struct stat st = {};
+    if (stat(src.c_str(), &st) != 0) {
+        Serial.printf("gzip: '%s': %s\r\n", src.c_str(), strerror(errno));
+        return EXIT_FAILURE;
+    }
+    size_t total = (size_t)st.st_size;
+
+    FILE *in = fopen(src.c_str(), "rb");
+    if (!in) {
+        Serial.printf("gzip: cannot open '%s'\r\n", src.c_str());
+        return EXIT_FAILURE;
+    }
+
+    gzFile gz = gzopen(dst.c_str(), "wb9");
+    if (!gz) {
+        Serial.printf("gzip: cannot create '%s'\r\n", dst.c_str());
+        fclose(in);
+        return EXIT_FAILURE;
+    }
+
+    const size_t kBufSz = 32768;
+    char *buf = (char *)psram_malloc(kBufSz);
+    if (!buf) {
+        Serial.printf("gzip: out of memory\r\n");
+        gzclose(gz);
+        fclose(in);
+        return EXIT_FAILURE;
+    }
+
+    Serial.printf("gzip: '%s' -> '%s' (%zu bytes)\r\n", src.c_str(), dst.c_str(), total);
+
+    size_t written = 0, last_report = 0;
+    const size_t kReport = 512 * 1024;
+    size_t n;
+    while ((n = fread(buf, 1, kBufSz, in)) > 0) {
+        gzwrite(gz, buf, (unsigned)n);
+        written += n;
+        if (total > 0 && written - last_report >= kReport) {
+            Serial.printf("  %zu / %zu bytes (%d%%)\r\n",
+                          written, total, (int)(written * 100 / total));
+            last_report = written;
+        }
+    }
+
+    free(buf);
+    gzclose(gz);
+    fclose(in);
+    if (total > 0 && last_report < written)
+        Serial.printf("  %zu / %zu bytes (100%%)\r\n", written, total);
+    Serial.printf("gzip: done\r\n");
+    return EXIT_SUCCESS;
+}
+
+// ─── unzipx ────────────────────────────────────────────────────────────────────
+// Creates every path segment (mkdir -p semantics) via MFile::mkDir(), so it
+// works for any MFSOwner-addressable destination, not just local flash/SD.
+// Intermediate segments that already exist are expected to fail — ignored,
+// matching the previous POSIX mkdir()-based behavior.
+// `last_dir` is the directory the previous entry went into. Archives list
+// entries grouped by directory, so remembering just the last one skips the
+// whole walk for every entry after the first in each directory.
+//
+// It matters for memory, not speed. Each MFSOwner::File() here probes for a
+// `.config` at every level above it, and that cache holds 64 entries and
+// clears wholesale on overflow - which a deep archive triggers, so the probes
+// fall through to real fopen()s on SD. Each of those needs a 512-byte
+// MALLOC_CAP_DMA bounce buffer per sector plus a newlib FILE lock, both
+// internal-DRAM-only. That storm is what turned an archive with a deep tree
+// into `sdmmc_read_sectors: not enough mem` and then an abort() inside
+// fopen(). (A std::set of every segment created would skip marginally more
+// work, but instantiating one costs ~1 KB of flash text - enough to push
+// fujiloaf-rev0 past its iram0_2_seg limit.)
+static void unzip_mkdirs(const std::string &path, std::string &last_dir)
+{
+    if (path == last_dir)
+        return;
+
+    for (size_t pos = path.find('/', 1); pos != std::string::npos; pos = path.find('/', pos + 1)) {
+        std::unique_ptr<MFile> dir(MFSOwner::File(path.substr(0, pos)));
+        if (dir) dir->mkDir();
+    }
+    std::unique_ptr<MFile> dir(MFSOwner::File(path));
+    if (dir) dir->mkDir();
+
+    last_dir = path;
+}
+
+// Mirrors ArchiveMFile::isSingleFileCompression()/getInnerFilename() without
+// reaching into that class's internals — just enough to route a single-file
+// compressed input (.gz, .bz2, ...) through its one decoded stream instead
+// of ArchiveMFile's directory tree-walk (see below).
+static const char *const kCompressionExts[] = {".gz", ".bz2", ".xz", ".lz", ".z", ".zst", ".lz4", nullptr};
+
+// Tar-based (and cpio-based) compressions are multi-file archives — the
+// decompressed stream is itself a tar whose entries must be extracted, not a
+// single file. Must be checked before the plain compression suffixes since
+// ".tar.gz" also ends ".gz".
+static const char *const kTarCompressionExts[] = {
+    ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".tar.lz", ".tar.z",
+    ".tar.zst", ".tar.lz4", ".cpgz", nullptr};
+
+static bool is_single_file_compression(const std::string &name)
+{
+    for (int i = 0; kTarCompressionExts[i]; i++)
+        if (mstr::endsWith(name, kTarCompressionExts[i], false))
+            return false;
+    for (int i = 0; kCompressionExts[i]; i++)
+        if (mstr::endsWith(name, kCompressionExts[i], false))
+            return true;
+    return false;
+}
+
+static std::string strip_compression_ext(const std::string &name)
+{
+    for (int i = 0; kCompressionExts[i]; i++)
+        if (mstr::endsWith(name, kCompressionExts[i], false))
+            return name.substr(0, name.length() - strlen(kCompressionExts[i]));
+    return name;
+}
+
+// Copies bytes from readFn into destPath (an MFile opened for write),
+// creating parent directories as needed. Prints progress for large entries.
+// readFn(buf, n) returns bytes read, 0 at end-of-entry. Returns bytes copied,
+// or -1 on error.
+// Make an archive-stored entry path safe to append to a destination folder.
+//
+// An archive can name an entry "../../etc/passwd" or "/etc/passwd", and unzipx
+// extracts from http:// and smb:// sources as readily as from local ones - so
+// honouring stored paths verbatim would let a hostile archive write anywhere on
+// the device (the classic zip-slip). Leading separators are dropped, "." is
+// skipped, and ".." pops the previous component but can never climb above the
+// destination. Backslashes are treated as separators too: archives written on
+// Windows sometimes store them.
+//
+// Returns "" when nothing usable is left, in which case the entry is skipped.
+static std::string unzip_safe_relpath(const std::string &name)
+{
+    std::string out;
+    size_t i = 0;
+    while (i < name.size()) {
+        size_t j = name.find_first_of("/\\", i);
+        std::string comp = (j == std::string::npos) ? name.substr(i) : name.substr(i, j - i);
+        i = (j == std::string::npos) ? name.size() : j + 1;
+
+        if (comp.empty() || comp == ".") continue;
+        if (comp == "..") {
+            size_t s = out.rfind('/');
+            out = (s == std::string::npos) ? std::string() : out.substr(0, s);
+            continue;   // popping an empty path is a no-op, so dest is the floor
+        }
+        if (!out.empty()) out += '/';
+        out += comp;
+    }
+    return out;
+}
+
+static int64_t unzip_write_entry(uint8_t *buf, size_t bufSize,
+                                  const std::function<uint32_t(uint8_t *, uint32_t)> &readFn,
+                                  const std::string &destPath, int64_t entry_size,
+                                  std::string &last_dir)
+{
+    const int64_t kProgressThreshold = 512 * 1024;
+    const size_t kReport = 256 * 1024;
+
+    size_t slash = destPath.rfind('/');
+    if (slash != std::string::npos)
+        unzip_mkdirs(destPath.substr(0, slash), last_dir);
+
+    std::unique_ptr<MFile> outFile(MFSOwner::File(destPath));
+    std::shared_ptr<MStream> outStream = outFile ? outFile->getSourceStream(std::ios_base::out) : nullptr;
+    if (!outStream || !outStream->isOpen()) {
+        Serial.printf("unzipx: cannot create '%s'\r\n", destPath.c_str());
+        return -1;
+    }
+
+    size_t entry_bytes = 0, last_report = 0;
+    uint32_t n;
+    while ((n = readFn(buf, bufSize)) > 0) {
+        outStream->write(buf, n);
+        entry_bytes += n;
+        if (entry_size >= kProgressThreshold && entry_bytes - last_report >= kReport) {
+            Serial.printf("    %zu / %lld bytes (%d%%)\r\n",
+                          entry_bytes, (long long)entry_size,
+                          (int)(entry_bytes * 100 / (size_t)entry_size));
+            last_report = entry_bytes;
+        }
+    }
+    outStream->close();
+    return (int64_t)entry_bytes;
+}
+
+static int cmd_unzipx(int argc, char **argv)
+{
+    // -j ("junk paths") extracts every entry straight into the destination.
+    // Without it the archive's stored directory structure is recreated, which
+    // is what unzip(1) does by default.
+    bool junk_paths = false;
+    int argi = 1;
+    while (argi < argc && argv[argi][0] == '-' && argv[argi][1] != '\0') {
+        for (const char *p = argv[argi] + 1; *p; p++) {
+            if (*p == 'j') junk_paths = true;
+            else {
+                Serial.printf("unzipx: invalid option -- '%c'\r\n", *p);
+                return EXIT_FAILURE;
+            }
+        }
+        argi++;
+    }
+
+    if (argi >= argc) {
+        Serial.printf("usage: unzipx [-j] <archive> [dest_folder]\r\n");
+        Serial.printf("  -j  junk paths: extract all files into the destination folder\r\n");
+        return EXIT_FAILURE;
+    }
+
+    std::string src = resolve_path(argv[argi]);
+
+    std::unique_ptr<MFile> srcFile(MFSOwner::File(src));
+    if (!srcFile || !srcFile->exists()) {
+        Serial.printf("unzipx: cannot open '%s'\r\n", src.c_str());
+        return EXIT_FAILURE;
+    }
+
+    std::string dest;
+    if (argc > argi + 1) {
+        dest = resolve_path(argv[argi + 1]);
+    } else if (!srcFile->scheme.empty()) {
+        // Network source (http, https, ftp, smb, ...): "same directory as
+        // source" would try to write the extracted files back to the remote
+        // server, which always fails. Default to the current directory instead.
+        dest = getCurrentPath()->url;
+    } else {
+        size_t slash = src.rfind('/');
+        dest = (slash != std::string::npos) ? src.substr(0, slash) : getCurrentPath()->url;
+    }
+    while (dest.size() > 1 && dest.back() == '/') dest.pop_back();
+
+    uint8_t *buf = (uint8_t *)psram_malloc(4096);
+    if (!buf) {
+        Serial.printf("unzipx: out of memory\r\n");
+        return EXIT_FAILURE;
+    }
+
+    int count = 0;
+    size_t total_bytes = 0;
+    // Directory the previous entry was written into, so a deep archive does
+    // not re-walk (and re-probe for .config) the same tree for every entry.
+    std::string last_dir;
+
+    if (is_single_file_compression(srcFile->name)) {
+        // Take the output name BEFORE opening the stream. For a single-file
+        // compression ArchiveMFile::getDecodedStream() ends with
+        // resetURL(base()) — it repoints the MFile at the containing
+        // directory so the CWD is right after a LOAD — which leaves
+        // srcFile->name empty. Reading it afterwards produced a path of
+        // "<dest>/", and fopen() on a directory fails with EACCES.
+        const std::string out_name = strip_compression_ext(srcFile->name);
+
+        // .gz/.bz2/etc: exactly one decompressed entry. getSourceStream()
+        // already resolves this transparently — the same path LOAD uses.
+        std::shared_ptr<MStream> srcStream = srcFile->getSourceStream(std::ios_base::in);
+        if (!srcStream || !srcStream->isOpen()) {
+            Serial.printf("unzipx: cannot open '%s'\r\n", src.c_str());
+            free(buf);
+            return EXIT_FAILURE;
+        }
+
+        // Prefer what the archive says the content is called, now that the
+        // stream is open and the entry resolved: a .gz stores the original
+        // filename in its header, and a URL basename is percent-encoded
+        // (`ordeal%2b2100p.d64.gz` on the server is
+        // `ordeal +2 100% (ntsc pal) wanderer.d64` inside). out_name, taken
+        // from the URL before opening, is the fallback.
+        std::string resolved = srcFile->getDownloadFilename();
+        std::string path = dest + "/" + (resolved.empty() ? out_name : resolved);
+        int64_t entry_size = (int64_t)srcStream->size();
+        Serial.printf("  %s  (%lld bytes)\r\n", path.c_str(), (long long)entry_size);
+
+        int64_t written = unzip_write_entry(
+            buf, 4096,
+            [srcStream](uint8_t *b, uint32_t n) { return srcStream->read(b, n); },
+            path, entry_size, last_dir);
+        if (written < 0) {
+            free(buf);
+            return EXIT_FAILURE;
+        }
+        total_bytes = (size_t)written;
+        count = 1;
+    } else {
+        // Multi-file archive: ONE forward pass over a single shared stream.
+        // extractAll() walks the archive once (reusing the one ImageBroker
+        // "archive" instance) and streams each entry's RAW bytes to us — no
+        // per-entry reopen/rescan, and only ONE source is ever open, so a
+        // pooled HTTP connection is never reset mid-read. Raw bytes are written
+        // as-is: format-recognized entries (.g64/.d81/…) are extracted as the
+        // stored file, never decoded into the files inside the image.
+        bool ok = srcFile->extractAll(
+            [&](const std::string &name, uint32_t size,
+                const std::function<uint32_t(uint8_t *, uint32_t)> &read) -> bool {
+                // 'name' is the path as stored in the archive. Sanitise it so a
+                // hostile entry cannot write outside dest, then flatten it if
+                // -j was given. unzip_write_entry() creates any missing parent
+                // directories, which is what recreates the structure.
+                std::string rel = unzip_safe_relpath(name);
+                if (junk_paths) {
+                    size_t s = rel.rfind('/');
+                    if (s != std::string::npos) rel = rel.substr(s + 1);
+                }
+                if (rel.empty()) {
+                    Serial.printf("  (skipped unsafe entry '%s')\r\n", name.c_str());
+                    return true;
+                }
+
+                std::string path = dest + "/" + rel;
+                Serial.printf("  %s  (%u bytes)\r\n", path.c_str(), size);
+                int64_t written = unzip_write_entry(buf, 4096, read, path, (int64_t)size, last_dir);
+                if (written >= 0) {
+                    total_bytes += (size_t)written;
+                    count++;
+                }
+                return true;  // keep walking even if one entry failed to write
+            });
+        if (!ok) {
+            Serial.printf("unzipx: cannot read archive '%s'\r\n", src.c_str());
+            free(buf);
+            return EXIT_FAILURE;
+        }
+    }
+
+    free(buf);
+
+    Serial.printf("unzipx: extracted %d entries, %zu bytes to '%s'\r\n",
+                  count, total_bytes, dest.c_str());
+    return EXIT_SUCCESS;
+}
+#endif // MIN_CONFIG
 
 namespace ESP32Console::Commands
 {
     const ConsoleCommand getCatCommand()
     {
         return ConsoleCommand("cat", &cat, "Show the content of one or more files.");
+    }
+
+    const ConsoleCommand getHexCommand()
+    {
+        return ConsoleCommand("hex", &hex, "Show the content of one or more files as hex.");
     }
 
     const ConsoleCommand getPWDCommand()
@@ -445,7 +2381,14 @@ namespace ESP32Console::Commands
 
     const ConsoleCommand getLsCommand()
     {
-        return ConsoleCommand("ls", &ls, "List the contents of the given path");
+        return ConsoleCommand("ls", &ls,
+            "List the contents of the given path. Usage: ls [-a] [path]  (-a shows hidden entries)");
+    }
+
+    const ConsoleCommand getPartitionCommand()
+    {
+        return ConsoleCommand("partition", &partition,
+            "List or switch CMD HD/FD or IDE64 CFS partitions. Usage: partition [number|name]");
     }
 
     const ConsoleCommand getMvCommand()
@@ -460,7 +2403,7 @@ namespace ESP32Console::Commands
 
     const ConsoleCommand getRMCommand()
     {
-         return ConsoleCommand("rm", &rm, "Permanenty deletes the given file.");
+         return ConsoleCommand("rm", &rm, "Permanently deletes files. Usage: rm [-rf] FILE...", "[-rf] FILE...");
     }
 
     const ConsoleCommand getRMDirCommand()
@@ -483,8 +2426,56 @@ namespace ESP32Console::Commands
         return ConsoleCommand("mount", &mount, "Mount url on device id");
     }
 
+    const ConsoleCommand getAuthCommand()
+    {
+        return ConsoleCommand("auth", &auth, "Set username and password for current path");
+    }
+
     const ConsoleCommand getWgetCommand()
     {
-        return ConsoleCommand("wget", &wget, "Download url to file");
+        return ConsoleCommand("wget", &wget, "Download url to file (-k skips TLS cert verification)");
     }
+
+    const ConsoleCommand getUpdateCommand()
+    {
+        return ConsoleCommand("update", &update, "Update firmware from file on sd card");
+    }
+
+    const ConsoleCommand getDFCommand()
+    {
+        return ConsoleCommand("df", &df, "Show filesystem disk space usage");
+    }
+
+#ifndef MIN_CONFIG
+    const ConsoleCommand getGzipCommand()
+    {
+        return ConsoleCommand("gzip", &cmd_gzip, "Compress a file to .gz (level 9)");
+    }
+
+    const ConsoleCommand getUnzipxCommand()
+    {
+        return ConsoleCommand("unzipx", &cmd_unzipx,
+            "Extract an archive, recreating its directory structure. Usage: unzipx [-j] <archive> [dest]");
+    }
+#endif
+
+#ifdef SD_CARD
+    const ConsoleCommand getFormatSDCommand()
+    {
+        return ConsoleCommand("format_sd", &format_sd, "Format the SD card (use -y to confirm)");
+    }
+
+#ifndef DISABLE_LOCATEDB
+    const ConsoleCommand getUpdatedbCommand()
+    {
+        return ConsoleCommand("updatedb", &updatedb,
+            "Build the locate database from the SD card. Usage: updatedb [start|status|stop|resume|fts]");
+    }
+
+    const ConsoleCommand getLocateCommand()
+    {
+        return ConsoleCommand("locate", &locate, "Search the locate database for files matching a pattern");
+    }
+#endif // !DISABLE_LOCATEDB
+#endif
 }

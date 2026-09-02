@@ -1,7 +1,20 @@
 #include "SystemCommands.h"
 
 #include <cstring>
+#include <cstdlib>
+#include <string>
+#include <vector>
+#include <esp_heap_caps.h>
 
+#include "mlConfig.h"
+#include "../../device/iec/meatloaf.h"
+
+static inline void *psram_malloc(size_t sz) {
+    void *p = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return p ? p : malloc(sz);
+}
+
+#include <freertos/task.h>
 #include <esp_partition.h>
 #include <esp_ota_ops.h>
 #include <esp_system.h>
@@ -21,16 +34,14 @@
 
 #include "../ESP32Console.h"
 
-#include "../../../include/version.h"
-
+//#include "../../../include/version.h"
 #include "Esp.h"
-
-EspClass ESP;
 
 static std::string mac2String(uint64_t mac)
 {
     uint8_t *ar = (uint8_t *)&mac;
     std::string s;
+    s.reserve(17); // 6 hex pairs + 5 colons
     for (uint8_t i = 0; i < 6; ++i)
     {
         char buf[3];
@@ -94,45 +105,47 @@ static int sysInfo(int argc, char **argv)
     esp_chip_info_t info;
     esp_chip_info(&info);
 
-    printf("FujiNet %s\r\n", FN_VERSION_FULL);
-//    printf("ESP32Console version: %s\r\n", ESP32CONSOLE_VERSION);
-//    printf("Arduino Core version: %s (%x)\r\n", XTSTR(ARDUINO_ESP32_GIT_DESC), ARDUINO_ESP32_GIT_VER);
-    printf("ESP-IDF v%s\r\n", ESP.getSdkVersion());
-
-    printf("\r\n");
-    printf("Chip info:\r\n");
-    printf("\tModel: %s\r\n", ESP.getChipModel());
-    printf("\tRevison number: %d\r\n", ESP.getChipRevision());
-    printf("\tCores: %d\r\n", ESP.getChipCores());
-    printf("\tClock: %lu MHz\r\n", ESP.getCpuFreqMHz());
-    printf("\tFeatures:%s%s%s%s%s\r\r\n",
+    Serial.printf("Meatloaf v%s (%s)\r\n\r\n", ESP.getFirmwareVersion().c_str(), ESP.getHardwareVersion().c_str());
+//    Serial.printf("ESP32Console version: %s\r\n", ESP32CONSOLE_VERSION);
+//    Serial.printf("Arduino Core version: %s (%x)\r\n", XTSTR(ARDUINO_ESP32_GIT_DESC), ARDUINO_ESP32_GIT_VER);
+    Serial.printf("ESP-IDF v%s\r\n", ESP.getSdkVersion());
+    Serial.printf("Chip info:\r\n");
+    Serial.printf(" Model: %s\r\n", ESP.getChipModel());
+    Serial.printf(" Revison number: %d\r\n", ESP.getChipRevision());
+    Serial.printf(" Cores: %d\r\n", ESP.getChipCores());
+    Serial.printf(" Clock: %lu MHz\r\n", ESP.getCpuFreqMHz());
+    Serial.printf(" Features:%s%s%s%s%s\r\r\n",
            info.features & CHIP_FEATURE_WIFI_BGN ? " 802.11bgn " : "",
            info.features & CHIP_FEATURE_BLE ? " BLE " : "",
            info.features & CHIP_FEATURE_BT ? " BT " : "",
            info.features & CHIP_FEATURE_EMB_FLASH ? " Embedded-Flash " : " External-Flash ",
            info.features & CHIP_FEATURE_EMB_PSRAM ? " Embedded-PSRAM" : "");
 
-    printf("EFuse MAC: %s\r\n", mac2String(ESP.getEfuseMac()).c_str());
+    Serial.printf("EFuse MAC: %s\r\n", mac2String(ESP.getEfuseMac()).c_str());
 
-    printf("Flash size: %ld MB (mode: %s, speed: %ld MHz)\r\n", ESP.getFlashChipSize() / (1024 * 1024), getFlashModeStr(), ESP.getFlashChipSpeed() / (1024 * 1024));
-    printf("PSRAM size: %ld MB\r\n", ESP.getPsramSize() / (1024 * 1024));
-
-#ifndef CONFIG_APP_REPRODUCIBLE_BUILD
-    printf("Compilation datetime: " __DATE__ " " __TIME__ "\r\n");
+    Serial.printf("Flash size: %lu MB (mode: %s, speed: %lu MHz)\r\n", ESP.getFlashChipSize() / (1024 * 1024), getFlashModeStr(), ESP.getFlashChipSpeed() / (1024 * 1024));
+#if defined(CONFIG_SPIRAM)
+    Serial.printf("PSRAM size: %lu KB\r\n", ESP.getPsramSize() / 1024);
+#if defined(CONFIG_IDF_TARGET_ESP32)
+    Serial.printf("HIMEM size: %lu KB\r\n", ESP.getPsramHiMemSize() / 1024);
+    Serial.printf("HIMEM free: %lu KB\r\n", ESP.getPsramHiMemFree() / 1024);
+    Serial.printf("HIMEM reserved: %lu KB\r\n", ESP.getPsramHiMemReserved() / 1024);
+#endif
 #endif
 
-    //printf("\nReset reason: %s\r\n", getResetReasonStr());
+    Serial.printf("\r\n");
+    Serial.printf("Partition Info\r\n\r\n%s\r\n", ESP.getPartitionInfo().c_str());
 
-    //printf("\r\n");
-    //printf("CPU temperature: %.01f °C\r\n", ESP.temperatureRead());
 
-    return EXIT_SUCCESS;
-}
+// #ifndef CONFIG_APP_REPRODUCIBLE_BUILD
+//     Serial.printf("Compilation datetime: " __DATE__ " " __TIME__ "\r\n");
+// #endif
 
-static int restart(int argc, char **argv)
-{
-    printf("Restarting...");
-    ESP.restart();
+    //Serial.printf("\nReset reason: %s\r\n", getResetReasonStr());
+
+    //Serial.printf("\r\n");
+    //Serial.printf("CPU temperature: %.01f °C\r\n", ESP.temperatureRead());
+
     return EXIT_SUCCESS;
 }
 
@@ -144,23 +157,44 @@ static int meminfo(int argc, char **argv)
     uint32_t min = ESP.getMinFreeHeap() / 1024;
     uint32_t total_free = esp_get_free_heap_size() / 1024;
 
-    printf("Internal Heap: %lu KB free, %lu KB used, (%lu KB total)\r\n", free, used, total);
-    printf("Minimum free heap size during uptime was: %lu KB\r\n", min);
-    printf("Overall Free Memory: %lu KB\r\n\r\n", total_free);
+    Serial.printf("Internal Heap: %lu KB free, %lu KB used, (%lu KB total)\r\n", free, used, total);
+    Serial.printf("Minimum free heap size during uptime was: %lu KB\r\n", min);
+    Serial.printf("Overall Free Memory: %lu KB\r\n", total_free);
 
+    // Largest CONTIGUOUS block, which is what an allocation actually needs.
+    // Free-vs-largest is the difference between "out of memory" and
+    // "fragmented", and only the second number tells you which one you have.
+    Serial.printf("Largest free block: %lu bytes 8-bit, %lu bytes internal\r\n\r\n",
+                  (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                  (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+
+#if defined(CONFIG_SPIRAM)
     total = ESP.getPsramSize() / 1024;
-    free = ESP.getFreePsram() / 1024;
+    free = ESP.getPsramFree() / 1024;
     used = total - free;    
-    printf("PSRAM: %lu KB free, %lu KB used, (%lu KB total)\r\n", free, used, total);
+    Serial.printf("PSRAM: %lu KB free, %lu KB used, (%lu KB total)\r\n", free, used, total);
+
+#if defined(CONFIG_IDF_TARGET_ESP32)
+    total = ESP.getPsramHiMemSize() / 1024;
+    free = ESP.getPsramHiMemFree() / 1024;
+    used = total - free;    
+    Serial.printf("HIMEM: %lu KB free, %lu KB used, (%lu KB total)\r\n", free, used, total);
+#endif
+#endif
+
+    Debug_memory();
     return EXIT_SUCCESS;
 }
 
 static int taskinfo(int argc, char **argv)
 {
-    printf( "Task Name\tStatus\tPrio\tHWM\tTask\tAffinity\r\r\n");
-    char stats_buffer[1024];
-    vTaskList(stats_buffer);
-    printf("%s\r\r\n", stats_buffer);
+    Serial.printf("Task Name\tStatus\tPrio\tHWM\tTask\tAffinity\r\n");
+    char *stats_buffer = (char *)psram_malloc(1024);
+    if (stats_buffer) {
+        vTaskList(stats_buffer);
+        Serial.printf("%s\r\n", stats_buffer);
+        free(stats_buffer);
+    }
     return EXIT_SUCCESS;
 }
 
@@ -182,10 +216,10 @@ static int date(int argc, char **argv)
             set_time = true;
             break;
         case '?':
-            printf("Unknown option: %c\r\n", optopt);
+            Serial.printf("Unknown option: %c\r\n", optopt);
             return 1;
         case ':':
-            printf("Missing arg for %c\r\n", optopt);
+            Serial.printf("Missing arg for %c\r\n", optopt);
             return 1;
         }
 
@@ -198,7 +232,7 @@ static int date(int argc, char **argv)
     {
         if (!target)
         {
-            fprintf(stderr, "Set option requires an datetime as argument in format '%%Y-%%m-%%d %%H:%%M:%%S' (e.g. 'date -s \"2022-07-13 22:47:00\"'\r\n");
+            Serial.printf("Set option requires an datetime as argument in format '%%Y-%%m-%%d %%H:%%M:%%S' (e.g. 'date -s \"2022-07-13 22:47:00\"'\r\n");
             return 1;
         }
 
@@ -206,7 +240,7 @@ static int date(int argc, char **argv)
 
         if (!strptime(target, "%Y-%m-%d %H:%M:%S", &t))
         {
-            fprintf(stderr, "Set option requires an datetime as argument in format '%%Y-%%m-%%d %%H:%%M:%%S' (e.g. 'date -s \"2022-07-13 22:47:00\"'\r\n");
+            Serial.printf("Set option requires an datetime as argument in format '%%Y-%%m-%%d %%H:%%M:%%S' (e.g. 'date -s \"2022-07-13 22:47:00\"'\r\n");
             return 1;
         }
 
@@ -216,7 +250,7 @@ static int date(int argc, char **argv)
 
         if (settimeofday(&tv, nullptr))
         {
-            fprintf(stderr, "Could not set system time: %s", strerror(errno));
+            Serial.printf("Could not set system time: %s", strerror(errno));
             return 1;
         }
 
@@ -225,7 +259,7 @@ static int date(int argc, char **argv)
         constexpr int buffer_size = 100;
         char buffer[buffer_size];
         strftime(buffer, buffer_size, "%a %b %e %H:%M:%S %Z %Y", localtime(&tmp));
-        printf("Time set: %s\r\n", buffer);
+        Serial.printf("Time set: %s\r\n", buffer);
 
         return 0;
     }
@@ -239,7 +273,7 @@ static int date(int argc, char **argv)
     // Ensure the format string is correct
     if (target[0] != '+')
     {
-        fprintf(stderr, "Format string must start with an +!\r\n");
+        Serial.printf("Format string must start with an +!\r\n");
         return 1;
     }
 
@@ -250,19 +284,121 @@ static int date(int argc, char **argv)
     char buffer[buffer_size];
     time_t t = time(nullptr);
     strftime(buffer, buffer_size, target, localtime(&t));
-    printf("%s\r\n", buffer);
+    Serial.printf("%s\r\n", buffer);
     return 0;
 
     return EXIT_SUCCESS;
 }
 
-namespace ESP32Console::Commands
+static void split_dotpath(const char *path, std::vector<std::string> &parts)
 {
-    const ConsoleCommand getRestartCommand()
-    {
-        return ConsoleCommand("restart", &restart, "Restart / Reboot the system");
+    const char *p = path;
+    while (*p) {
+        const char *dot = strchr(p, '.');
+        if (!dot) {
+            parts.emplace_back(p);
+            break;
+        }
+        parts.emplace_back(p, dot - p);
+        p = dot + 1;
+    }
+}
+
+static int config_cmd(int argc, char **argv)
+{
+    if (argc == 1) {
+        Serial.printf("%s\r\n", mlConfig.data().dump(2).c_str());
+        return EXIT_SUCCESS;
     }
 
+    if (argc == 2 && strcmp(argv[1], "load") == 0) {
+        if (!mlConfig.load()) {
+            Serial.printf("Failed to reload config\r\n");
+            return 1;
+        }
+        // Apply the reloaded config to the live devices (enabled flag, mounted
+        // URL), not just the in-memory JSON — this command runs on the console
+        // executor's 16 KB stack, so it's safe to do the deep MFile work inline.
+        bool deferred = Meatloaf.reloadAllConfig();
+        Serial.printf("Config reloaded\r\n");
+        if (deferred)
+            Serial.printf("Note: a drive's network URL restore was deferred (WiFi not connected)\r\n");
+        return EXIT_SUCCESS;
+    }
+
+    std::vector<std::string> parts;
+    split_dotpath(argv[1], parts);
+    if (parts.empty()) {
+        Serial.printf("Invalid key\r\n");
+        return 1;
+    }
+
+    bool writing = (argc >= 3);
+    psram_json *node = &mlConfig.data();
+
+    for (size_t i = 0; i + 1 < parts.size(); i++) {
+        if (!node->is_object()) {
+            Serial.printf("'%s' is not an object\r\n", parts[i].c_str());
+            return 1;
+        }
+        if (!node->contains(parts[i])) {
+            if (!writing) {
+                Serial.printf("Key not found: %s\r\n", argv[1]);
+                return 1;
+            }
+            (*node)[parts[i]] = psram_json::object();
+        }
+        node = &(*node)[parts[i]];
+    }
+
+    const std::string &leaf = parts.back();
+
+    if (!writing) {
+        if (!node->contains(leaf)) {
+            Serial.printf("Key not found: %s\r\n", argv[1]);
+            return 1;
+        }
+        auto &val = (*node)[leaf];
+        if (val.is_string())
+            Serial.printf("%s\r\n", val.get<std::string>().c_str());
+        else
+            Serial.printf("%s\r\n", val.dump().c_str());
+        return EXIT_SUCCESS;
+    }
+
+    // Parse the new value: bool, integer, float, or string.
+    const char *raw = argv[2];
+    psram_json new_val;
+    if (strcmp(raw, "true") == 0) {
+        new_val = true;
+    } else if (strcmp(raw, "false") == 0) {
+        new_val = false;
+    } else if (strcmp(raw, "null") == 0) {
+        new_val = nullptr;
+    } else {
+        char *end;
+        long long i = strtoll(raw, &end, 10);
+        if (*end == '\0' && end != raw) {
+            new_val = i;
+        } else {
+            double d = strtod(raw, &end);
+            if (*end == '\0' && end != raw)
+                new_val = d;
+            else
+                new_val = std::string(raw);
+        }
+    }
+
+    (*node)[leaf] = new_val;
+
+    // save() detects by hash whether config.json and/or devices.json changed.
+    mlConfig.save();
+    Serial.printf("%s = %s\r\n", argv[1], (*node)[leaf].dump().c_str());
+    return EXIT_SUCCESS;
+}
+
+namespace ESP32Console::Commands
+{
     const ConsoleCommand getSysInfoCommand()
     {
         return ConsoleCommand("sysinfo", &sysInfo, "Shows informations about the system like chip model and ESP-IDF version");
@@ -281,5 +417,12 @@ namespace ESP32Console::Commands
     const ConsoleCommand getDateCommand()
     {
         return ConsoleCommand("date", &date, "Shows and modify the system time");
+    }
+
+    const ConsoleCommand getConfigCommand()
+    {
+        return ConsoleCommand("config", &config_cmd,
+            "Read or write mlConfig values, or reload from disk. Usage: config [key[.subkey] [value]] | config load",
+            "[key [value] | load]");
     }
 }

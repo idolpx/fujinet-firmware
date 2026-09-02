@@ -1,70 +1,236 @@
 #include "Console.h"
 
 #include <fcntl.h>
+#include <unistd.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "soc/soc_caps.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 
 #include "Commands/CoreCommands.h"
+#include "Commands/DisplayCommands.h"
+#include "Commands/PS2Commands.h"
 #include "Commands/SystemCommands.h"
+#include "Commands/IECCommands.h"
 #include "Commands/NetworkCommands.h"
 #include "Commands/VFSCommands.h"
 #include "Commands/GPIOCommands.h"
 #include "Commands/XFERCommands.h"
 #include "driver/uart.h"
-#include "esp_vfs_dev.h"
-#include "linenoise/linenoise.h"
+#include "driver/uart_vfs.h"
+#ifdef CONFIG_IDF_TARGET_ESP32S3
+#include "driver/usb_serial_jtag.h"
+#include "driver/usb_serial_jtag_vfs.h"
+#endif
 #include "Helpers/PWDHelpers.h"
 #include "Helpers/InputParser.h"
 
 #include "../../include/debug.h"
 #include "string_utils.h"
+#include "console_settings.h"
 
-#include <driver/uart_vfs.h>
+#include "meat_session.h"
+
+#include "tcpsvr.h"
+#include "mlConfig.h"
+#include "Esp.h"
+
+// Defined in SystemCommands.cpp; do_reboot() below needs ESP.restart().
+extern EspClass ESP;
+
+ESP32Console::Console console;
+
+// "reboot" must work even when the executor can't be created (memory
+// pressure) or is busy — same reasoning as "exit" below. Executes
+// immediately in the calling shell task rather than being submitted to
+// console_exec.
+static void do_reboot()
+{
+    printf("Saving configuration...\r\n");
+    mlConfig.save();
+    printf("Rebooting...\r\n");
+    ESP.restart();
+}
+
+// SessionBroker entry that frees the 16 KB console executor task after
+// 3 minutes without a command. Keep-alive is disabled (nothing to ping);
+// the broker's service task disposes the session once it has been idle
+// past its grace period, and disconnect() tears the task down. The next
+// runCommand() re-creates both the task and the session.
+class ConsoleExecMSession : public MSession {
+public:
+    static constexpr uint32_t IDLE_TIMEOUT_MS = 3 * 60 * 1000;
+    static const char* sessionKey() { return "console://exec:0"; }
+
+    ConsoleExecMSession(ESP32Console::Console* c)
+        : MSession(sessionKey(), "exec", 0), console_(c)
+    {
+        keep_alive_interval = 0;
+        setIdleGracePeriod(IDLE_TIMEOUT_MS);
+        connected = true;
+    }
+
+    ~ConsoleExecMSession() { disconnect(); }
+
+    bool connect() override { connected = true; return true; }
+    bool keep_alive() override { return true; }
+
+    void disconnect() override {
+        if (!connected) return;
+        connected = false;
+        console_->execIdleFree();
+    }
+
+private:
+    ESP32Console::Console* console_;
+};
+
+#ifdef ENABLE_CONSOLE_TCP
+// Tee FILE* installed on the TCP task's stdout for the duration of a client
+// session. Non-null means a client is connected and all stdout writes go to
+// both UART (via _tee_orig) and TCP (via tcp_server.send).
+static FILE *_tee      = nullptr;
+static FILE *_tee_orig = nullptr;
+
+static ssize_t _stdout_tee_write(void *cookie, const char *buf, size_t n)
+{
+    fwrite(buf, 1, n, (FILE *)cookie);
+    tcp_server.send(std::string(buf, n));
+    return (ssize_t)n;
+}
+static cookie_io_functions_t _stdout_tee_fns = {
+    .read = nullptr, .write = _stdout_tee_write, .seek = nullptr, .close = nullptr
+};
+#endif
 
 using namespace ESP32Console::Commands;
 
 namespace ESP32Console
 {
+    /**
+     * @brief Register the given command, using the raw ESP-IDF structure.
+     *
+     * @param cmd The command that should be registered
+     * @return Return true, if the registration was successfull, false if not.
+     */
+    bool Console::registerCommand(const esp_console_cmd_t *cmd)
+    {
+        //Debug_printv("Registering new command %s", cmd->command);
+
+        auto code = esp_console_cmd_register(cmd);
+        if (code != ESP_OK)
+        {
+            Debug_printv("Error registering command (Reason %s)", esp_err_to_name(code));
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * @brief Register the given command
+     *
+     * @param cmd The command that should be registered
+     * @return true If the command was registered successful.
+     * @return false If the command was not registered because of an error.
+     */
+    bool Console::registerCommand(const ConsoleCommandBase &cmd)
+    {
+        auto c = cmd.toCommandStruct();
+        return registerCommand(&c);
+    }
+
+    /**
+     * @brief Registers the given command
+     *
+     * @param command The name under which the command can be called (e.g. "ls"). Must not contain spaces.
+     * @param func A pointer to the function which should be run, when this command is called
+     * @param help A text shown in output of "help" command describing this command. When empty it is not shown in help.
+     * @param hint A text describing the usage of the command in help output
+     * @return true If the command was registered successful.
+     * @return false If the command was not registered because of an error.
+     */
+    bool Console::registerCommand(const char *command, esp_console_cmd_func_t func, const char *help, const char *hint)
+    {
+        const esp_console_cmd_t cmd = {
+            .command = command,
+            .help = help,
+            .hint = hint,
+            .func = func,
+            .argtable = nullptr
+        };
+
+        return registerCommand(&cmd);
+    };
+
     void Console::registerCoreCommands()
     {
         registerCommand(getClearCommand());
-        registerCommand(getHistoryCommand());
         registerCommand(getEchoCommand());
-        registerCommand(getSetMultilineCommand());
         registerCommand(getEnvCommand());
         registerCommand(getDeclareCommand());
-#ifdef ENABLE_DISPLAY
-        registerCommand(getLEDCommand());
-#endif
+        registerCommand(getRunCommand());
+        registerCommand(getRebootCommand());
+        registerCommand(getExitCommand());
     }
 
     void Console::registerSystemCommands()
     {
         registerCommand(getSysInfoCommand());
-        registerCommand(getRestartCommand());
         registerCommand(getMemInfoCommand());
         registerCommand(getTaskInfoCommand());
         registerCommand(getDateCommand());
+        registerCommand(getConfigCommand());
+    }
+
+    void Console::registerDisplayCommands()
+    {
+#ifdef ENABLE_DISPLAY
+        registerCommand(getLEDCommand());
+        registerCommand(getShowCommand());
+#endif
+    }
+
+    void Console::registerPS2Commands()
+    {
+        registerCommand(getPS2Command());
+    }
+
+    void Console::registerIECCommands()
+    {
+        registerCommand(getIECCommand());
+        registerCommand(getUseCommand());
+        registerCommand(getExecCommand());
+        registerCommand(getOpenCommand());
+        registerCommand(getReadCommand());
+        registerCommand(getWriteCommand());
+        registerCommand(getCloseCommand());
+        registerCommand(getChannelsCommand());
     }
 
     void ESP32Console::Console::registerNetworkCommands()
     {
         registerCommand(getPingCommand());
-        registerCommand(getIpconfigCommand());
+        registerCommand(getIfconfigCommand());
+        registerCommand(getNetstatCommand());
         registerCommand(getScanCommand());
         registerCommand(getConnectCommand());
-        registerCommand(getIMPROVCommand());
+#ifndef MIN_CONFIG
+        registerCommand(getWsCommand());
+#endif
     }
 
     void Console::registerVFSCommands()
     {
+        registerCommand(getDFCommand());
         registerCommand(getCatCommand());
+        registerCommand(getHexCommand());
         registerCommand(getCDCommand());
         registerCommand(getPWDCommand());
         registerCommand(getLsCommand());
+        registerCommand(getPartitionCommand());
         registerCommand(getMvCommand());
         registerCommand(getCPCommand());
         registerCommand(getRMCommand());
@@ -72,7 +238,22 @@ namespace ESP32Console
         registerCommand(getMKDirCommand());
         registerCommand(getEditCommand());
         registerCommand(getMountCommand());
+        registerCommand(getAuthCommand());
         registerCommand(getWgetCommand());
+        registerCommand(getUpdateCommand());
+        registerCommand(getEnableCommand());
+        registerCommand(getDisableCommand());
+#ifndef MIN_CONFIG
+        registerCommand(getGzipCommand());
+        registerCommand(getUnzipxCommand());
+#endif
+#ifdef SD_CARD
+        registerCommand(getFormatSDCommand());
+#ifndef DISABLE_LOCATEDB
+        registerCommand(getUpdatedbCommand());
+        registerCommand(getLocateCommand());
+#endif
+#endif
     }
 
     void Console::registerGPIOCommands()
@@ -92,104 +273,396 @@ namespace ESP32Console
 
     void Console::beginCommon()
     {
-        /* Tell linenoise where to get command completions and hints */
-        linenoiseSetCompletionCallback(&esp_console_get_completion);
-        linenoiseSetHintsCallback((linenoiseHintsCallback *)&esp_console_get_hint);
-
-        /* Set command history size */
-        linenoiseHistorySetMaxLen(max_history_len_);
-
-        /* Set command maximum length */
-        linenoiseSetMaxLineLen(max_cmdline_len_);
-
-        // Load history if defined
-        if (history_save_path_)
-        {
-            linenoiseHistoryLoad(history_save_path_);
-        }
+        // Nothing configures linenoise here: the REPL reads its own lines
+        // (Console::readLine) and never calls linenoise(), so its line editor,
+        // history, completion and hints are all unreachable.
 
         // Register core commands like echo
         esp_console_register_help_command();
         registerCoreCommands();
     }
 
-    void Console::begin(int baud, int rxPin, int txPin, uint8_t channel)
+    // Line input for the serial REPL: prompt, echo, backspace, enter. This is
+    // deliberately not linenoise. Its editor re-derives the cursor's row and
+    // column from the prompt and buffer widths after every keystroke, which
+    // misrenders once the prompt approaches the terminal width; its dumb-mode
+    // fallback does no cursor arithmetic but types the tail of any escape
+    // sequence into the buffer (an arrow key becomes a literal "[A") and, on a
+    // read that returns 0 rather than an error — what a disconnected USB CDC or
+    // USB-Serial-JTAG host produces — fills the line with a stale character and
+    // submits it as a command. Nothing here moves the cursor, so terminal width
+    // never enters into it, and a read that yields nothing ends the line.
+    //
+    // Given up against a full editor: history recall, tab completion, hints and
+    // cursor movement within the line.
+    //
+    // Returns false when no line could be read; the caller backs off and
+    // reprompts.
+    bool Console::readLine(const std::string &prompt, std::string &out)
     {
-        Debug_printv("Initialize console");
+        out.clear();
 
-        if (channel >= SOC_UART_NUM)
-        {
-            Debug_printv("Serial number is invalid, please use numers from 0 to %u", SOC_UART_NUM - 1);
-            return;
-        }
-
-        this->uart_channel_ = channel;
-
-        //Reinit the UART driver if the channel was already in use
-        if (uart_is_driver_installed((uart_port_t)channel)) {
-            uart_driver_delete((uart_port_t)channel);
-        }
-
-        /* Drain stdout before reconfiguring it */
+        fputs(prompt.c_str(), stdout);
         fflush(stdout);
-        fsync(fileno(stdout));
 
-        /* Disable buffering on stdin */
-        setvbuf(stdin, NULL, _IONBF, 0);
+        const int fd = fileno(stdin);
+        while (out.length() + 1 < max_cmdline_len_)
+        {
+            char c;
+            if (read(fd, &c, 1) != 1)
+                return false;
 
-        /* Minicom, screen, idf_monitor send CR when ENTER key is pressed */
-        uart_vfs_dev_port_set_rx_line_endings(channel, ESP_LINE_ENDINGS_CR);
-        /* Move the caret to the beginning of the next line on '\n' */
-        uart_vfs_dev_port_set_tx_line_endings(channel, ESP_LINE_ENDINGS_CRLF);
+            if (c == '\n')
+                break;
 
-        /* Enable non-blocking mode on stdin and stdout */
-        fcntl(fileno(stdout), F_SETFL, 0);
-        fcntl(fileno(stdin), F_SETFL, 0);
-
-
-        /* Configure UART. Note that REF_TICK is used so that the baud rate remains
-         * correct while APB frequency is changing in light sleep mode.
-         */
-        const uart_config_t uart_config = {
-            .baud_rate = baud,
-            .data_bits = UART_DATA_8_BITS,
-            .parity = UART_PARITY_DISABLE,
-            .stop_bits = UART_STOP_BITS_1,
-            .source_clk = UART_SCLK_DEFAULT,
-        };
-
-
-        ESP_ERROR_CHECK(uart_param_config((uart_port_t)channel, &uart_config));
-
-        // Set the correct pins for the UART of needed
-        if (rxPin > 0 || txPin > 0) {
-            if (rxPin < 0 || txPin < 0) {
-                Debug_printv("Both rxPin and txPin has to be passed!");
+            if (c == 0x7F || c == 0x08) // DEL / backspace
+            {
+                if (!out.empty())
+                {
+                    out.pop_back();
+                    fputs("\b \b", stdout);
+                    fflush(stdout);
+                }
+                continue;
             }
-            uart_set_pin((uart_port_t)channel, txPin, rxPin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+
+            if (c == 0x1B) // ESC: discard the escape sequence it introduces
+            {
+                char next;
+                if (read(fd, &next, 1) != 1)
+                    return false;
+                if (next == '[') // CSI: parameter bytes, then a final byte
+                {
+                    char seq;
+                    do
+                    {
+                        if (read(fd, &seq, 1) != 1)
+                            return false;
+                    } while (seq >= 0x30 && seq <= 0x3F);
+                }
+                else if (next == 'O') // SS3: one final byte
+                {
+                    char seq;
+                    if (read(fd, &seq, 1) != 1)
+                        return false;
+                }
+                continue;
+            }
+
+            if ((unsigned char)c < 0x20) // remaining control characters
+                continue;
+
+            out += c;
+            fputc(c, stdout);
+            fflush(stdout);
         }
 
-        /* Install UART driver for interrupt-driven reads and writes */
-        ESP_ERROR_CHECK(uart_driver_install((uart_port_t)channel, 256, 0, 0, NULL, 0));
+        // One '\n': the console's TX line-ending translation expands it to CRLF.
+        fputc('\n', stdout);
+        fflush(stdout);
+        return true;
+    }
 
-        /* Tell VFS to use UART driver */
-        uart_vfs_dev_use_driver((uart_port_t)channel);
+    // Renders the prompt template for both the serial REPL and the TCP session.
+    std::string Console::buildPrompt()
+    {
+        std::string p = prompt_;
 
-        esp_console_config_t console_config = {
-            .max_cmdline_length = max_cmdline_len_,
-            .max_cmdline_args = max_cmdline_args_,
-            .hint_color = 333333
-        };
+        mstr::replaceAll(p, "%pwd%", getCurrentPathUrl());
 
-        ESP_ERROR_CHECK(esp_console_init(&console_config));
+        int dev = iecSelectedDeviceId();
+        mstr::replaceAll(p, "%dev%", dev ? std::to_string(dev) + ":" : std::string());
+
+        std::time_t current_time = std::time(nullptr);
+        char time_buffer[11] = {};
+        std::strftime(time_buffer, sizeof(time_buffer), "%I:%M:%S%p", std::localtime(&current_time));
+        std::string time_str(time_buffer);
+        time_str = time_str.substr(0, 9);
+        mstr::toLower(time_str);
+        mstr::replaceAll(p, "%time%", time_str);
+
+        return p;
+    }
+
+    void Console::begin(int baud, int rxPin, int txPin, uart_port_t channel)
+    {
+        //Debug_printv("Initialize console");
+
+        (void)rxPin;
+        (void)txPin;
+        (void)channel;
+
+        // Use shared ESP-IDF style console setup for peripheral + stdio
+        // behavior. The requested baud (DEBUG_SPEED) overrides the sdkconfig
+        // CONFIG_ESP_CONSOLE_UART_BAUDRATE.
+        initialize_console_peripheral(baud);
+
+        // Initialize esp_console using the shared settings module.
+        initialize_console_library();
 
         beginCommon();
 
-        // Start REPL task
+        // The console (stdio, esp_console, commands) is usable now; the REPL
+        // task itself is started separately via startRepl()/startOnDemand()
+        // so its stack is not allocated until the console is actually used.
+        _initialized = true;
+
+        // Executor synchronization objects live forever (tiny); the 16 KB
+        // executor task itself exists only while a console is active — see
+        // execAcquire()/execRelease().
+        exec_mutex_ = xSemaphoreCreateMutex();
+        exec_start_ = xSemaphoreCreateBinary();
+        exec_done_  = xSemaphoreCreateBinary();
+        exec_users_mutex_ = xSemaphoreCreateMutex();
+    }
+
+    // Logged whenever console_exec task creation fails, so a repro shows
+    // whether it's outright exhaustion or fragmentation (free vs. largest
+    // contiguous block) — mirrors the diagnostics on the httpd task-create
+    // failure path in web_server.cpp.
+    static void log_exec_task_create_failure()
+    {
+        Debug_printv("Could not start console exec task! free_internal=%u largest_internal_block=%u",
+                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    }
+
+    void Console::execAcquire()
+    {
+        xSemaphoreTake(exec_users_mutex_, portMAX_DELAY);
+        exec_users_++;
+        if (exec_task_ == nullptr)
+        {
+            // All commands (serial, TCP, WS) run on this one executor task
+            // so the console I/O shells only need small stacks. It exists
+            // only while a console session is active; its 16 KB internal
+            // stack is released when the last session goes dormant.
+            if (xTaskCreatePinnedToCore(&Console::exec_task_fn, "console_exec", 16384, this, 5, &exec_task_, 0) != pdTRUE)
+            {
+                log_exec_task_create_failure();
+                exec_task_ = nullptr;
+            }
+        }
+        xSemaphoreGive(exec_users_mutex_);
+
+        if (exec_task_ != nullptr)
+            execSessionTouch();
+    }
+
+    void Console::execRelease()
+    {
+        xSemaphoreTake(exec_users_mutex_, portMAX_DELAY);
+        if (exec_users_ > 0 && --exec_users_ == 0 && exec_task_ != nullptr)
+        {
+            // Taking exec_mutex_ waits out any in-flight command; deleting
+            // while holding it keeps runCommand() from submitting to a dead
+            // task (it re-checks exec_task_ under the same mutex).
+            xSemaphoreTake(exec_mutex_, portMAX_DELAY);
+            vTaskDelete(exec_task_);
+            exec_task_ = nullptr;
+            xSemaphoreGive(exec_mutex_);
+        }
+        xSemaphoreGive(exec_users_mutex_);
+    }
+
+    void Console::execIdleFree()
+    {
+        // Same teardown protocol as execRelease(), but leaves exec_users_
+        // untouched: consoles may still be attached, just idle. The next
+        // runCommand() re-creates the task via its late-creation retry.
+        xSemaphoreTake(exec_users_mutex_, portMAX_DELAY);
+        if (exec_task_ != nullptr)
+        {
+            xSemaphoreTake(exec_mutex_, portMAX_DELAY);
+            vTaskDelete(exec_task_);
+            exec_task_ = nullptr;
+            xSemaphoreGive(exec_mutex_);
+            //Debug_printv("console exec task freed after idle timeout");
+        }
+        xSemaphoreGive(exec_users_mutex_);
+    }
+
+    std::shared_ptr<MSession> Console::execSessionTouch()
+    {
+        // find() refreshes the session's activity timestamp; register a new
+        // session when the previous one was disposed by the idle timeout.
+        auto session = SessionBroker::find<MSession>(ConsoleExecMSession::sessionKey());
+        if (session == nullptr)
+        {
+            session = std::make_shared<ConsoleExecMSession>(this);
+            SessionBroker::add(ConsoleExecMSession::sessionKey(), session);
+        }
+        return session;
+    }
+
+    void Console::exec_task_fn(void *args)
+    {
+        Console *c = static_cast<Console *>(args);
+
+        while (true)
+        {
+            xSemaphoreTake(c->exec_start_, portMAX_DELAY);
+
+            // stdio streams are per-task: the TCP stdout tee is installed on
+            // the session task, not here. For remote-origin commands, adopt
+            // the tee for the duration of the command so output reaches the
+            // TCP client (and UART) exactly as it did when commands ran in
+            // the session task itself.
+            FILE *prev_stdout = stdout;
+#ifdef ENABLE_CONSOLE_TCP
+            if (c->exec_origin_ == ORIGIN_REMOTE && _tee != nullptr)
+                stdout = _tee;
+#endif
+
+            if (c->exec_fn_)
+            {
+                c->exec_fn_();
+                c->exec_err_ = ESP_OK;
+                c->exec_ret_ = 0;
+            }
+            else
+            {
+                c->exec_err_ = esp_console_run(c->exec_line_, &c->exec_ret_);
+            }
+
+            fflush(stdout);
+            stdout = prev_stdout;
+
+            // Reset getopt state here rather than in the submitter so the
+            // next command never sees a stale optind.
+            optind = 0;
+            xSemaphoreGive(c->exec_done_);
+        }
+    }
+
+    esp_err_t Console::runCommand(const char *line, int *ret, Origin origin)
+    {
+        // Late creation retry: if execAcquire() failed at session start,
+        // memory may have freed since (e.g. a web transfer finished).
+        if (exec_task_ == nullptr)
+        {
+            xSemaphoreTake(exec_users_mutex_, portMAX_DELAY);
+            if (exec_users_ > 0 && exec_task_ == nullptr &&
+                xTaskCreatePinnedToCore(&Console::exec_task_fn, "console_exec", 16384, this, 5, &exec_task_, 0) != pdTRUE)
+            {
+                log_exec_task_create_failure();
+                exec_task_ = nullptr;
+            }
+            xSemaphoreGive(exec_users_mutex_);
+        }
+
+        // Refresh the idle-timeout session and mark it busy for the duration
+        // of the command so the broker never tears the task down mid-command.
+        auto session = execSessionTouch();
+        if (session)
+            session->acquireIO();
+
+        xSemaphoreTake(exec_mutex_, portMAX_DELAY);
+
+        // Checked under exec_mutex_: execRelease() deletes the task while
+        // holding this mutex, so the worker cannot vanish after this check.
+        // Refuse rather than run inline — the submitting I/O shells have
+        // small stacks and heavy commands would overflow them (the original
+        // heap-corruption bug).
+        if (exec_task_ == nullptr)
+        {
+            xSemaphoreGive(exec_mutex_);
+            if (session)
+                session->releaseIO();
+            ::printf("Cannot execute command: console exec task not running\r\n");
+            if (ret)
+                *ret = EXIT_FAILURE;
+            return ESP_FAIL;
+        }
+
+        exec_fn_ = nullptr;   // ensure exec_task_fn takes the esp_console_run() branch
+        exec_line_ = line;
+        exec_origin_ = origin;
+        xSemaphoreGive(exec_start_);
+        xSemaphoreTake(exec_done_, portMAX_DELAY);
+        esp_err_t err = exec_err_;
+        if (ret)
+            *ret = exec_ret_;
+        exec_origin_ = ORIGIN_NONE;
+        xSemaphoreGive(exec_mutex_);
+        if (session)
+        {
+            // Idle timeout counts from command completion, not submission
+            session->updateActivity();
+            session->releaseIO();
+        }
+        return err;
+    }
+
+    esp_err_t Console::runOnExecutor(std::function<void()> fn)
+    {
+        // Mirrors runCommand()'s submission choreography, but runs an
+        // arbitrary function on the executor task instead of a parsed
+        // command line.
+        if (exec_task_ == nullptr)
+        {
+            xSemaphoreTake(exec_users_mutex_, portMAX_DELAY);
+            if (exec_users_ > 0 && exec_task_ == nullptr &&
+                xTaskCreatePinnedToCore(&Console::exec_task_fn, "console_exec", 16384, this, 5, &exec_task_, 0) != pdTRUE)
+            {
+                log_exec_task_create_failure();
+                exec_task_ = nullptr;
+            }
+            xSemaphoreGive(exec_users_mutex_);
+        }
+
+        auto session = execSessionTouch();
+        if (session)
+            session->acquireIO();
+
+        xSemaphoreTake(exec_mutex_, portMAX_DELAY);
+
+        if (exec_task_ == nullptr)
+        {
+            xSemaphoreGive(exec_mutex_);
+            if (session)
+                session->releaseIO();
+            return ESP_FAIL;
+        }
+
+        exec_line_ = nullptr;   // ensure exec_task_fn takes the exec_fn_ branch
+        exec_fn_ = fn;
+        exec_origin_ = ORIGIN_NONE;
+        xSemaphoreGive(exec_start_);
+        xSemaphoreTake(exec_done_, portMAX_DELAY);
+        esp_err_t err = exec_err_;
+        exec_fn_ = nullptr;
+        xSemaphoreGive(exec_mutex_);
+        if (session)
+        {
+            session->updateActivity();
+            session->releaseIO();
+        }
+        return err;
+    }
+
+    void Console::startOnDemand()
+    {
+        if (!_initialized || task_ != nullptr)
+            return;
+
+        // One persistent serial-console task, created at boot: it sleeps in
+        // fgetc() until a byte arrives, runs the REPL loop, and goes dormant
+        // again on "exit". No task is ever created at activation time —
+        // that allocation failed under heap fragmentation no matter how
+        // small the stack (even 6 KB), because task stacks must be
+        // contiguous internal DRAM.
         if (xTaskCreatePinnedToCore(&Console::repl_task, "console_repl", task_stack_size_, this, task_priority_, &task_, 0) != pdTRUE)
         {
-            Debug_printv("Could not start REPL task!");
+            Debug_printv("Could not start console task!");
+            task_ = nullptr;
         }
+    }
+
+    void Console::startRepl()
+    {
+        // Same persistent task; kept for call-site compatibility.
+        startOnDemand();
     }
 
     static void resetAfterCommands()
@@ -202,7 +675,7 @@ namespace ESP32Console
 
     void Console::repl_task(void *args)
     {
-        Console const &console = *(static_cast<Console *>(args));
+        Console &console = *(static_cast<Console *>(args));
 
         /* Change standard input and output of the task if the requested UART is
          * NOT the default one. This block will replace stdin, stdout and stderr.
@@ -227,12 +700,8 @@ namespace ESP32Console
         //        "Use UP/DOWN arrows to navigate through command history.\r\n"
         //        "Press TAB when typing command name to auto-complete.\r\n");
 
-        // Probe terminal status
-        int probe_status = linenoiseProbe();
-        if (probe_status)
-        {
-            linenoiseSetDumbMode(1);
-        }
+        // Do not force dumb mode here. On some USB monitor setups this causes
+        // rapid empty reads and prompt flooding.
 
         // if (linenoiseIsDumbMode())
         // {
@@ -242,50 +711,97 @@ namespace ESP32Console
         //            "On Windows, try using Putty instead.\r\n");
         // }
 
-        linenoiseSetMaxLineLen(console.max_cmdline_len_);
+        // Keep stdin in blocking mode inside the REPL task to avoid a prompt spin
+        // when USB CDC reconnects briefly return no data.
+        int stdin_flags = fcntl(fileno(stdin), F_GETFL, 0);
+        if (stdin_flags >= 0)
+        {
+            fcntl(fileno(stdin), F_SETFL, stdin_flags & ~O_NONBLOCK);
+        }
+
         while (true)
         {
-            std::string prompt = console.prompt_;
+        // Dormant: wait for a byte on the console (usually ENTER; it is
+        // consumed). The task persists here instead of being deleted and
+        // re-created — activation can no longer fail on allocation.
+        while (fgetc(stdin) == EOF)
+        {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
 
-            // Insert current PWD into prompt if needed
-            mstr::replaceAll(prompt, "%pwd%", console_getpwd());
+        // Session became active: bring up the shared command executor.
+        console.execAcquire();
 
-            char *line = linenoise(prompt.c_str());
-            if (line == NULL)
+        while (true)
+        {
+            std::string prompt = console.buildPrompt();
+            std::string raw_line;
+            if (!console.readLine(prompt, raw_line))
             {
-                Debug_printv("empty line");
-                /* Ignore empty lines */
+                // Avoid tight-looping when input is temporarily unavailable.
+                vTaskDelay(pdMS_TO_TICKS(50));
                 continue;
             }
+            // ESP_LINE_ENDINGS_CR maps both \r and \n to \n, so a \r\n terminal
+            // leaves a second \n in the buffer after readLine consumes the first.
+            // Drain it non-blocking to prevent a double prompt on the next call.
+            {
+                int fl = fcntl(fileno(stdin), F_GETFL, 0);
+                fcntl(fileno(stdin), F_SETFL, fl | O_NONBLOCK);
+                int ch = fgetc(stdin);
+                fcntl(fileno(stdin), F_SETFL, fl);
+                if (ch != '\n' && ch != EOF) ungetc(ch, stdin);
+            }
 
-            //Debug_printv("Line received from linenoise: [%s]\n", line);
+            // Ignore empty/whitespace-only input lines.
+            mstr::trim(raw_line);
+            if (raw_line.empty())
+                continue;
 
-            // /* Add the command to the history */
-            // linenoiseHistoryAdd(line);
+            // "reboot" must work even when the executor can't be created
+            // (memory pressure) or is busy — handle it directly rather than
+            // submitting a command. Never returns.
+            if (raw_line == "reboot")
+            {
+                do_reboot();
+            }
 
-            // /* Save command history to filesystem */
-            // if (console.history_save_path_)
-            // {
-            //     linenoiseHistorySave(console.history_save_path_);
-            // }
+#ifdef SD_CARD
+            // "updatedb stop" must work while a scan is running. The scan
+            // occupies the executor, so submitting this as a command would
+            // queue it behind the very thing it is meant to cancel. It only
+            // sets a volatile flag the scan polls, so it is safe here.
+            if (raw_line == "updatedb stop")
+            {
+                if (updatedb_request_stop())
+                    ::printf("updatedb: stopping...\r\n");
+                else
+                    ::printf("updatedb: no scan in progress\r\n");
+                continue;
+            }
+#endif
+
+            // "exit" must work even when the executor can't be created
+            // (memory pressure) — handle it without submitting a command.
+            if (raw_line == "exit")
+            {
+                console._exit_requested = true;
+                break;
+            }
 
             //Interpolate the input line
-            std::string interpolated_line = interpolateLine(line);
-            //Debug_printv("Interpolated line: [%s]\n", interpolated_line.c_str());
+            std::string interpolated_line = interpolateLine(raw_line.c_str());
 
-            // Flush trailing CR
-            uart_flush((uart_port_t)CONSOLE_UART);
-
-            /* Try to run the command */
+            /* Run the command on the shared executor task */
             int ret;
-            esp_err_t err = esp_console_run(interpolated_line.c_str(), &ret);
+            esp_err_t err = console.runCommand(interpolated_line.c_str(), &ret, ORIGIN_SERIAL);
 
             //Reset global state
             resetAfterCommands();
 
             if (err == ESP_ERR_NOT_FOUND)
             {
-                printf("Unrecognized command\n");
+                fprintf(stdout, "Unrecognized command\n");
             }
             else if (err == ESP_ERR_INVALID_ARG)
             {
@@ -293,21 +809,322 @@ namespace ESP32Console
             }
             else if (err == ESP_OK && ret != ESP_OK)
             {
-                // printf("Command returned non-zero error code: 0x%x (%s)\n", ret, esp_err_to_name(ret));
+                fprintf(stdout, "Command returned non-zero error code: 0x%x (%s)\n", ret, esp_err_to_name(ret));
             }
             else if (err != ESP_OK)
             {
-                printf("Internal error: %s\n", esp_err_to_name(err));
+                fprintf(stdout, "Internal error: %s\n", esp_err_to_name(err));
             }
-            /* linenoise allocates line buffer on the heap, so need to free it */
-            linenoiseFree(line);
+            if (console._exit_requested)
+                break;
         }
-        //Debug_printv("REPL task ended");
-        vTaskDelete(NULL);
-        esp_console_deinit();
+
+        // "exit" was requested: go dormant (outer loop waits for the next
+        // byte of console input). The task and its stack persist; the
+        // shared executor is released (and freed if no other console holds it).
+        console._exit_requested = false;
+        console.execRelease();
+        ::printf("Console deactivated. Press ENTER to reactivate.\r\n");
+        }
     }
 
     void Console::end()
     {
+        // what do we need to do when exiting?
+    }
+
+    void Console::tcpBegin()
+    {
+#ifdef ENABLE_CONSOLE_TCP
+        if (_tee) return; // already active
+        _tee_orig = stdout;
+        FILE *tee = fopencookie(_tee_orig, "w", _stdout_tee_fns);
+        if (tee) {
+            setvbuf(tee, nullptr, _IONBF, 0);
+            stdout = tee;
+            _tee = tee;
+        }
+#endif
+    }
+
+    void Console::tcpEnd()
+    {
+#ifdef ENABLE_CONSOLE_TCP
+        if (!_tee) return;
+        fflush(_tee);
+        stdout = _tee_orig;
+        fclose(_tee);
+        _tee      = nullptr;
+        _tee_orig = nullptr;
+#endif
+    }
+
+    void Console::execute(const char *command)
+    {
+        if (command == nullptr)
+        {
+            return;
+        }
+
+        std::string command_str = command;
+        mstr::trim(command_str);
+
+        // "reboot" must work even when the executor can't be created (memory
+        // pressure) or is busy — handle it directly rather than submitting a
+        // command. Never returns.
+        if (command_str == "reboot")
+        {
+            do_reboot();
+        }
+
+#ifdef SD_CARD
+        // "updatedb stop" must work while a scan occupies the executor — see
+        // the matching interception in repl_task().
+        if (command_str == "updatedb stop")
+        {
+            if (updatedb_request_stop())
+                ::printf("updatedb: stopping...\r\n");
+            else
+                ::printf("updatedb: no scan in progress\r\n");
+            return;
+        }
+#endif
+
+#ifdef ENABLE_CONSOLE_TCP
+        // "exit" must work even when the executor can't be created
+        // (memory pressure) — drop the client without running a command.
+        if (command_str == "exit")
+        {
+            tcp_server.disconnect();
+            return;
+        }
+#endif
+
+        if (!command_str.empty())
+        {
+            lprint(command_str);
+            lprint("\n");
+
+            std::string interpolated_line = interpolateLine(command_str.c_str());
+
+            // Acquire/release around the command so WS-submitted commands
+            // (no console session holding the executor) still get the 16 KB
+            // executor stack. For TCP sessions this just bumps the refcount
+            // the session already holds.
+            execAcquire();
+            int ret;
+            esp_err_t err = runCommand(interpolated_line.c_str(), &ret, ORIGIN_REMOTE);
+            execRelease();
+
+            resetAfterCommands();
+
+            if (err == ESP_ERR_NOT_FOUND)
+                printf("Unrecognized command\n");
+            else if (err == ESP_OK && ret != ESP_OK)
+                printf("Command returned non-zero error code: 0x%x (%s)\n", ret, esp_err_to_name(ret));
+            else if (err != ESP_OK)
+                printf("Internal error: %s\n", esp_err_to_name(err));
+        }
+
+#ifdef ENABLE_CONSOLE_TCP
+        // Prompt goes to TCP only — the REPL loop owns the UART prompt.
+        tcp_server.send(buildPrompt());
+#endif
+    }
+
+    size_t Console::write(uint8_t c)
+    {
+        return fwrite(&c, 1, 1, stdout);
+    }
+
+    size_t Console::write(const uint8_t *buffer, size_t size)
+    {
+        return fwrite(buffer, 1, size, stdout);
+    }
+
+    size_t Console::write(const char *str)
+    {
+        return fwrite(str, 1, strlen(str), stdout);
+    }
+
+    size_t Console::lprint(const char *str)
+    {
+        if (!_initialized)
+            return -1;
+
+        size_t z = strlen(str);
+        fwrite(str, 1, z, stdout);
+#ifdef ENABLE_CONSOLE_TCP
+        // stdio is per-task: only the task that installed (or adopted) the
+        // tee reaches TCP via stdout. From any other task — e.g. the
+        // esp_ping callbacks — mirror to TCP explicitly.
+        if (stdout != _tee)
+            tcp_server.send(std::string(str, z));
+#endif
+        return z;
+    }
+    
+    size_t Console::lprint(const std::string &str)
+    {
+        if (!_initialized)
+            return -1;
+    
+        return lprint(str.c_str());
+    }
+
+    size_t Console::printf(const char *fmt...)
+    {
+        if (!_initialized)
+            return -1;
+
+        va_list vargs;
+        va_start(vargs, fmt);
+#ifdef ENABLE_CONSOLE_TCP
+        // stdio is per-task: only the task that installed (or adopted) the
+        // tee reaches TCP via stdout. From any other task — e.g. the
+        // esp_ping callbacks printing replies — mirror to TCP explicitly
+        // (tcp_server.send() no-ops when no client is connected).
+        if (stdout != _tee) {
+            char *buf = nullptr;
+            int z = vasprintf(&buf, fmt, vargs);
+            va_end(vargs);
+            if (z < 0 || !buf)
+                return 0;
+            fwrite(buf, 1, z, stdout);
+            tcp_server.send(std::string(buf, z));
+            free(buf);
+            return z;
+        }
+#endif
+        int z = vfprintf(stdout, fmt, vargs);
+        va_end(vargs);
+        return z < 0 ? 0 : z;
+    }
+
+    size_t Console::_print_number(unsigned long n, uint8_t base)
+    {
+        char buf[8 * sizeof(long) + 1]; // Assumes 8-bit chars plus zero byte.
+        char *str = &buf[sizeof(buf) - 1];
+    
+        if (!_initialized)
+            return -1;
+    
+        *str = '\0';
+    
+        // prevent crash if called with base == 1
+        if (base < 2)
+            base = 10;
+    
+        do
+        {
+            unsigned long m = n;
+            n /= base;
+            char c = m - base * n;
+            *--str = c < 10 ? c + '0' : c + 'A' - 10;
+        } while (n);
+    
+        return write(str);
+    }
+    
+    size_t Console::print(const char *str)
+    {
+        if (!_initialized)
+            return -1;
+
+        return fwrite(str, 1, strlen(str), stdout);
+    }
+    
+    size_t Console::print(const std::string &str)
+    {
+        if (!_initialized)
+            return -1;
+    
+        return print(str.c_str());
+    }
+    
+    size_t Console::print(int n, int base)
+    {
+        if (!_initialized)
+            return -1;
+    
+        return print((long)n, base);
+    }
+    
+    size_t Console::print(unsigned int n, int base)
+    {
+        if (!_initialized)
+            return -1;
+    
+        return print((unsigned long)n, base);
+    }
+    
+    size_t Console::print(long n, int base)
+    {
+        if (!_initialized)
+            return -1;
+    
+        if (base == 0)
+        {
+            return write(n);
+        }
+        else if (base == 10)
+        {
+            if (n < 0)
+            {
+                int t = print('-');
+                n = -n;
+                return _print_number(n, 10) + t;
+            }
+            return _print_number(n, 10);
+        }
+        else
+        {
+            return _print_number(n, base);
+        }
+    }
+    
+    size_t Console::print(unsigned long n, int base)
+    {
+        if (!_initialized)
+            return -1;
+    
+        if (base == 0)
+        {
+            return write(n);
+        }
+        else
+        {
+            return _print_number(n, base);
+        }
+    }
+
+    size_t Console::println(const char *str)
+    {
+        if (!_initialized)
+            return -1;
+    
+        size_t n = print(str);
+        n += println();
+        return n;
+    }
+    
+    size_t Console::println(std::string str)
+    {
+        if (!_initialized)
+            return -1;
+    
+        size_t n = print(str);
+        n += println();
+        return n;
+    }
+    
+    size_t Console::println(int num, int base)
+    {
+        if (!_initialized)
+            return -1;
+    
+        size_t n = print(num, base);
+        n += println();
+        return n;
     }
 };
