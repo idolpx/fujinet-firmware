@@ -87,6 +87,7 @@ typedef enum class CMD : uint8_t {
     FUJI_GET_DEVICE2_FULLPATH       = 0xA1,
     FUJI_GET_DEVICE1_FULLPATH       = 0xA0,
     FUJI_UPDATE_FIRMWARE            = 0x90,
+    FUJI_EXTRACT_ARCHIVE            = 0x91,
     FUJI_STATUS                     = 0x53, // S
     FUJI_HSIO_INDEX                 = 0x3F, // ?
     FUJI_NAK                        = 0x15, // ASCII NAK
