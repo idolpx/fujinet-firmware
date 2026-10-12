@@ -30,6 +30,7 @@ Host-side unit tests and policy checks for the FujiNet-PC build. ctest runs them
 | `AfpUamTests.cpp` | The whole `afpfs_fn` library linked on the host, and its registered login methods (`afp_uam_tests`) |
 | `AfpLoopTests.cpp` | The afpfs-ng event loop leaves the host's `SIGINT` and `SIGTERM` handlers in place (`afp_loop_tests`) |
 | `AfpSocketTests.cpp` | `components/afpfs-ng/lib/afp_socket.h`: failures reach `errno`, and a write after the peer hung up does not raise `SIGPIPE` (`afp_socket_tests`) |
+| `AfpPathTests.cpp` | `lib/afp/afpPath.cpp` splitting a URL path into volume and path (`afp_path_tests`) |
 | `AfpServerListTests.cpp`, `AfpServerListHelper.c` | afpfs-ng server reuse by address, signature and user over loopback sockets (`afp_server_list_tests`; not built on Windows) |
 | `AfpCloseSessionTests.cpp`, `AfpCloseSessionHelper.c` | afpfs-ng when the server ends a session with a volume mounted: the event loop keeps running and the server is freed later by a caller (`afp_close_session_tests`; not built on Windows) |
 | `CasTapeTests.cpp`, `CassetteRewindRequestTests.cpp`, `CassetteTrailTests.cpp` | Atari cassette record timing, rewind request and trail (`cassette_tests`) |
