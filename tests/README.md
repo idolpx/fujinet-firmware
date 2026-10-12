@@ -27,6 +27,7 @@ Host-side unit tests and policy checks for the FujiNet-PC build. ctest runs them
 | `AfpGcryptTests.cpp` | `components/afpfs-ng/esp32/` gcrypt shim against RFC 1321 and RFC 2144 vectors, and its random source (`afp_gcrypt_tests`) |
 | `AfpMacRomanTests.cpp` | `components/afpfs-ng/lib/macroman.c` MacRoman to UTF-8, including truncation (`afp_macroman_tests`) |
 | `AfpUamTests.cpp` | The whole `afpfs_fn` library linked on the host, and its registered login methods (`afp_uam_tests`) |
+| `AfpLoopTests.cpp` | The afpfs-ng event loop leaves the host's `SIGINT` and `SIGTERM` handlers in place (`afp_loop_tests`) |
 | `CasTapeTests.cpp`, `CassetteRewindRequestTests.cpp`, `CassetteTrailTests.cpp` | Atari cassette record timing, rewind request and trail (`cassette_tests`) |
 | `CasFSKTests.cpp` | `lib/media/atari/casFSK.cpp` run scan, chunk checks and timing (`casfsk_tests`) |
 | `CasFSKLoaderTests.cpp` | The value-to-symbol encoder in `casFSK.h` and the progressive loader in `lib/media/atari/casFSKLoader.cpp` (`casfskloader_tests`) |
