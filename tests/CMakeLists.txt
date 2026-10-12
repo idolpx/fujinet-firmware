@@ -378,7 +378,7 @@ add_test(NAME mac_gcr_tests COMMAND mac_gcr_tests)
 
 # ------------------------------------------------------------------------------
 # afpfs-ng server-reuse matching. server_match.c has no dependency on the rest
-# of the library, which does not build on the host.
+# of the library.
 # ------------------------------------------------------------------------------
 add_executable(afp_server_match_tests
     AfpServerMatchTests.cpp
@@ -389,6 +389,81 @@ target_include_directories(afp_server_match_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/components_pc/   # doctest
 )
 add_test(NAME afp_server_match_tests COMMAND afp_server_match_tests)
+
+# ------------------------------------------------------------------------------
+# afpfs-ng's gcrypt shim (MbedTLS bignum and MD5, CAST5, random) against
+# published vectors.
+# ------------------------------------------------------------------------------
+add_executable(afp_gcrypt_tests
+    AfpGcryptTests.cpp
+    ${CMAKE_SOURCE_DIR}/components/afpfs-ng/esp32/gcrypt.c
+    ${CMAKE_SOURCE_DIR}/components/afpfs-ng/esp32/cast5.c
+    ${CMAKE_SOURCE_DIR}/components/afpfs-ng/esp32/afp_random.c
+)
+target_include_directories(afp_gcrypt_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/components/afpfs-ng/esp32/
+    ${MBEDTLS_INCLUDE_DIR}
+    ${CMAKE_SOURCE_DIR}/components_pc/   # doctest
+)
+target_link_libraries(afp_gcrypt_tests PRIVATE ${MBEDCRYPTO_STATIC_LIB} pthread)
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+    target_link_libraries(afp_gcrypt_tests PRIVATE bcrypt)
+endif()
+add_test(NAME afp_gcrypt_tests COMMAND afp_gcrypt_tests)
+
+# ------------------------------------------------------------------------------
+# afpfs-ng MacRoman to UTF-8. macroman.c stands alone.
+# ------------------------------------------------------------------------------
+add_executable(afp_macroman_tests
+    AfpMacRomanTests.cpp
+    ${CMAKE_SOURCE_DIR}/components/afpfs-ng/lib/macroman.c
+)
+target_include_directories(afp_macroman_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/components/afpfs-ng/lib/
+    ${CMAKE_SOURCE_DIR}/components_pc/   # doctest
+)
+add_test(NAME afp_macroman_tests COMMAND afp_macroman_tests)
+
+# ------------------------------------------------------------------------------
+# afpfs-ng linked as a whole on the host.
+# ------------------------------------------------------------------------------
+add_executable(afp_uam_tests AfpUamTests.cpp)
+target_include_directories(afp_uam_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/components_pc/   # doctest
+)
+target_link_libraries(afp_uam_tests PRIVATE afpfs_fn)
+add_test(NAME afp_uam_tests COMMAND afp_uam_tests)
+
+add_executable(afp_loop_tests AfpLoopTests.cpp)
+target_include_directories(afp_loop_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/components_pc/   # doctest
+)
+target_link_libraries(afp_loop_tests PRIVATE afpfs_fn)
+add_test(NAME afp_loop_tests COMMAND afp_loop_tests)
+
+# afpfs-ng socket wrappers: errors through errno, no SIGPIPE.
+add_executable(afp_socket_tests AfpSocketTests.cpp)
+target_include_directories(afp_socket_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/components/afpfs-ng/lib/
+    ${CMAKE_SOURCE_DIR}/components_pc/   # doctest
+)
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+    target_link_libraries(afp_socket_tests PRIVATE ws2_32)
+endif()
+add_test(NAME afp_socket_tests COMMAND afp_socket_tests)
+
+# The server list itself, over loopback sockets. POSIX only.
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  add_executable(afp_server_list_tests
+      AfpServerListTests.cpp
+      AfpServerListHelper.c
+  )
+  target_include_directories(afp_server_list_tests PRIVATE
+      ${CMAKE_SOURCE_DIR}/components_pc/   # doctest
+  )
+  target_link_libraries(afp_server_list_tests PRIVATE afpfs_fn)
+  add_test(NAME afp_server_list_tests COMMAND afp_server_list_tests)
+endif()
 
 # ------------------------------------------------------------------------------
 # Atari cassette rewind: record durations (lib/media/atari/casTape.h), and the

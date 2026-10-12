@@ -24,6 +24,12 @@ Host-side unit tests and policy checks for the FujiNet-PC build. ctest runs them
 | `WebDavMethodsTests.cpp` | `lib/http/webdav/webdav_methods.h`: every method the WebDAV server handles is registered (`webdav_methods_tests`) |
 | `mac_gcr_test.cpp` | `lib/media/mac/macGCR.cpp` encode and decode round trip (`mac_gcr_tests`) |
 | `AfpServerMatchTests.cpp` | `components/afpfs-ng/lib/server_match.c` address and user matching for server reuse (`afp_server_match_tests`) |
+| `AfpGcryptTests.cpp` | `components/afpfs-ng/esp32/` gcrypt shim against RFC 1321 and RFC 2144 vectors, and its random source (`afp_gcrypt_tests`) |
+| `AfpMacRomanTests.cpp` | `components/afpfs-ng/lib/macroman.c` MacRoman to UTF-8, including truncation (`afp_macroman_tests`) |
+| `AfpUamTests.cpp` | The whole `afpfs_fn` library linked on the host, and its registered login methods (`afp_uam_tests`) |
+| `AfpLoopTests.cpp` | The afpfs-ng event loop leaves the host's `SIGINT` and `SIGTERM` handlers in place (`afp_loop_tests`) |
+| `AfpSocketTests.cpp` | `components/afpfs-ng/lib/afp_socket.h`: failures reach `errno`, and a write after the peer hung up does not raise `SIGPIPE` (`afp_socket_tests`) |
+| `AfpServerListTests.cpp`, `AfpServerListHelper.c` | afpfs-ng server reuse by address, signature and user over loopback sockets (`afp_server_list_tests`; not built on Windows) |
 | `CasTapeTests.cpp`, `CassetteRewindRequestTests.cpp`, `CassetteTrailTests.cpp` | Atari cassette record timing, rewind request and trail (`cassette_tests`) |
 | `CasFSKTests.cpp` | `lib/media/atari/casFSK.cpp` run scan, chunk checks and timing (`casfsk_tests`) |
 | `CasFSKLoaderTests.cpp` | The value-to-symbol encoder in `casFSK.h` and the progressive loader in `lib/media/atari/casFSKLoader.cpp` (`casfskloader_tests`) |

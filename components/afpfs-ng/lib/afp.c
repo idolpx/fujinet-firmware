@@ -32,6 +32,7 @@
 #include "forklist.h"
 #include "codepage.h"
 #include "server_match.h"
+#include "afp_socket.h"
 
 struct afp_versions      afp_versions[] = {
             { "AFPVersion 1.1", 11 },
@@ -803,9 +804,11 @@ int afp_server_connect(struct afp_server *server, int full)
 
         if (server->fd >= 0) 
 		{
+        	    afp_sock_prepare(server->fd);
         	    if (connect(server->fd, address->ai_addr, address->ai_addrlen) == 0)
         	        break;
-        	    close(server->fd);
+        	    error = afp_sock_errno();
+        	    afp_sock_close(server->fd);
         	    server->fd	= -1;
        	}
         address	= address->ai_next;
@@ -813,7 +816,7 @@ int afp_server_connect(struct afp_server *server, int full)
 
 	if(server->fd < 0)
 	{
-		error = errno;
+		if (!error) error = afp_sock_errno();
 		goto error;
 	}
 
