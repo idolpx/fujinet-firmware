@@ -28,6 +28,7 @@ Host-side unit tests and policy checks for the FujiNet-PC build. ctest runs them
 | `AfpMacRomanTests.cpp` | `components/afpfs-ng/lib/macroman.c` MacRoman to UTF-8, including truncation (`afp_macroman_tests`) |
 | `AfpUamTests.cpp` | The whole `afpfs_fn` library linked on the host, and its registered login methods (`afp_uam_tests`) |
 | `AfpLoopTests.cpp` | The afpfs-ng event loop leaves the host's `SIGINT` and `SIGTERM` handlers in place (`afp_loop_tests`) |
+| `AfpSocketTests.cpp` | `components/afpfs-ng/lib/afp_socket.h`: failures reach `errno`, and a write after the peer hung up does not raise `SIGPIPE` (`afp_socket_tests`) |
 | `AfpServerListTests.cpp`, `AfpServerListHelper.c` | afpfs-ng server reuse by address, signature and user over loopback sockets (`afp_server_list_tests`; not built on Windows) |
 | `CasTapeTests.cpp`, `CassetteRewindRequestTests.cpp`, `CassetteTrailTests.cpp` | Atari cassette record timing, rewind request and trail (`cassette_tests`) |
 | `CasFSKTests.cpp` | `lib/media/atari/casFSK.cpp` run scan, chunk checks and timing (`casfsk_tests`) |
