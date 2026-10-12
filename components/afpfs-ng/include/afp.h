@@ -213,6 +213,8 @@ struct afp_server {
 	char signature[16];
 	unsigned short flags;
 	int connect_state;
+	/* Set once login has completed; only then may the login be shared. */
+	unsigned char logged_in;
 	enum server_type server_type;
 
 	/* This is the time we connected */
@@ -381,8 +383,10 @@ int something_is_mounted(struct afp_server * server);
 
 int add_cache_entry(struct afp_file_info * file) ;
 struct afp_file_info * get_cache_by_name(char * name);
-struct afp_server * find_server_by_address(struct addrinfo * address);
-struct afp_server * find_server_by_signature(char * signature);
+struct afp_server * find_server_by_address(struct addrinfo * address,
+	const char * username);
+struct afp_server * find_server_by_signature(char * signature,
+	const char * username);
 struct afp_server * find_server_by_name(char * name);
 int server_still_valid(struct afp_server * server);
 

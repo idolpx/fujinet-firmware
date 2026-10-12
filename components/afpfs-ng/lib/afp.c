@@ -31,6 +31,7 @@
 #include "did.h"
 #include "forklist.h"
 #include "codepage.h"
+#include "server_match.h"
 
 struct afp_versions      afp_versions[] = {
             { "AFPVersion 1.1", 11 },
@@ -264,13 +265,22 @@ struct afp_server * get_server_base(void)
 	return server_base;
 }
 
-struct afp_server * find_server_by_signature(char * signature)
+/* The status probe in afp_server_full_connect() never logs in, so it is
+ * never handed out. */
+static int server_reusable(struct afp_server * s, const char * username)
+{
+	return afp_login_reusable(s->logged_in,s->username,username);
+}
+
+struct afp_server * find_server_by_signature(char * signature,
+	const char * username)
 {
 	struct afp_server * s, * found=NULL;
 
 	afp_server_list_lock();
 	for (s=server_base;s;s=s->next) {
-		if (memcmp(s->signature,signature,AFP_SIGNATURE_LEN)==0) {
+		if ((memcmp(s->signature,signature,AFP_SIGNATURE_LEN)==0) &&
+			server_reusable(s,username)) {
 			found=s;
 			break;
 		}
@@ -292,16 +302,16 @@ struct afp_server * find_server_by_name(char * name)
 	return found;
 }
 
-struct afp_server * find_server_by_address(struct addrinfo *address)
+struct afp_server * find_server_by_address(struct addrinfo * address,
+	const char * username)
 {
     struct afp_server *s, *found=NULL;
 
 	afp_server_list_lock();
 	for (s=server_base;s;s=s->next) {
-        if (s->used_address != NULL && s->used_address->ai_addr != NULL &&
-			address != NULL && address->ai_addr != NULL &&
-			bcmp(&s->used_address->ai_addr, &address->ai_addr,
-				sizeof(struct sockaddr))==0) {
+		if ((s->used_address!=NULL) &&
+			afp_addrinfo_has(address,s->used_address->ai_addr) &&
+			server_reusable(s,username)) {
 			found=s;
 			break;
 		}
