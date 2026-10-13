@@ -30,6 +30,7 @@ Host-side unit tests and policy checks for the FujiNet-PC build. ctest runs them
 | `AfpLoopTests.cpp` | The afpfs-ng event loop leaves the host's `SIGINT` and `SIGTERM` handlers in place (`afp_loop_tests`) |
 | `AfpSocketTests.cpp` | `components/afpfs-ng/lib/afp_socket.h`: failures reach `errno`, and a write after the peer hung up does not raise `SIGPIPE` (`afp_socket_tests`) |
 | `AfpPathTests.cpp` | `lib/afp/afpPath.cpp` splitting a URL path into volume and path (`afp_path_tests`) |
+| `AfpStatusTests.cpp` | `afp_errno_to_status()` in `lib/afp/afpStatus.cpp`: file, path and login errors to `NDEV_STATUS` (`afp_status_tests`) |
 | `AfpSessionTests.cpp` | `lib/afp/afpSession.cpp` sharing of logins and attachments, against the fake in `AfpFakeBridge.h` (`afp_session_tests`) |
 | `AfpFileTests.cpp` | `lib/afp/afpFile.cpp` open modes, positions, listings and the directory functions, against the same fake (`afp_file_tests`) |
 | `AfpFakeBridge.h` | An in-memory `afpBridge` for the two tests above: one server per user, logout with the last volume, and a small file tree per volume |
