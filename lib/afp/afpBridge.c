@@ -1,12 +1,16 @@
 /* The only file in FujiNet that includes afpfs-ng's headers.  See afpBridge.h. */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 #include "afp.h"
 #include "dsi.h"
+#include "midlevel.h"
 
 #include "afpBridge.h"
 
@@ -79,7 +83,6 @@ struct afp_server * afp_bridge_login(const char * host, int port,
 	const char * user, const char * password, int * error)
 {
 	struct afp_connection_request req;
-	struct addrinfo * resolved=NULL;
 	struct afp_server * server;
 
 	memset(&req,0,sizeof(req));
@@ -97,19 +100,10 @@ struct afp_server * afp_bridge_login(const char * host, int port,
 	strcpy(req.url.username,user);
 	strcpy(req.url.password,password);
 
-	/* The library reports every failure the same way, so find out here
-	 * whether the name resolves at all. */
-	if (getaddrinfo(host,NULL,NULL,&resolved)!=0) {
-		*error=-EHOSTUNREACH;
-		return NULL;
-	}
-	freeaddrinfo(resolved);
-
 	server=afp_server_full_connect(NULL,&req);
 	if (server==NULL) {
-		/* The library does not say why: a refused login and a server
-		 * that never answers look the same from here. */
-		*error=-EACCES;
+		/* The library leaves the cause in errno. */
+		*error=errno ? -errno : -EACCES;
 		return NULL;
 	}
 
@@ -162,4 +156,182 @@ void afp_bridge_release(struct afp_server * server)
 	if (something_is_mounted(server)) return;
 	afp_logout(server,DSI_DONT_WAIT);
 	afp_server_remove(server);
+}
+
+/* The library returns failures with either sign. */
+static int negative(int ret)
+{
+	return (ret>0) ? -ret : ret;
+}
+
+/* The library copies paths into fixed buffers without checking them. */
+static int check_path(const char * path)
+{
+	if ((path==NULL) || (path[0]!='/')) return -EINVAL;
+	if (strlen(path)>=AFP_MAX_PATH) return -ENAMETOOLONG;
+	return 0;
+}
+
+/* off_t is 32 bits on some targets; a wrapped offset would hit the wrong
+ * part of the file. */
+static int check_range(unsigned long long offset, unsigned int len)
+{
+	off_t start=(off_t) offset;
+	off_t end=(off_t) (offset+len);
+
+	if (((unsigned long long) start!=offset) || (start<0) || (end<start))
+		return -EFBIG;
+	return 0;
+}
+
+int afp_bridge_stat(struct afp_volume * volume, const char * path,
+	int * is_dir, unsigned long long * size)
+{
+	struct stat st;
+	int ret;
+
+	if ((ret=check_path(path))!=0) return ret;
+	memset(&st,0,sizeof(st));
+	if ((ret=ml_getattr(volume,path,&st))!=0) return negative(ret);
+	*is_dir=S_ISDIR(st.st_mode) ? 1 : 0;
+	/* The library invents a size for directories; a listing gives 0. */
+	*size=*is_dir ? 0 : (unsigned long long) st.st_size;
+	return 0;
+}
+
+int afp_bridge_open(struct afp_volume * volume, const char * path, int mode,
+	struct afp_file_info ** file)
+{
+	int flags, ret;
+
+	*file=NULL;
+	if ((ret=check_path(path))!=0) return ret;
+	switch (mode) {
+	case AFP_BRIDGE_READ: flags=O_RDONLY; break;
+	case AFP_BRIDGE_WRITE: flags=O_WRONLY|O_TRUNC; break;
+	case AFP_BRIDGE_APPEND: flags=O_WRONLY; break;
+	case AFP_BRIDGE_UPDATE: flags=O_RDWR; break;
+	default: return -EINVAL;
+	}
+
+	/* ml_open() does not create. */
+	if ((mode==AFP_BRIDGE_WRITE) || (mode==AFP_BRIDGE_APPEND)) {
+		ret=negative(ml_creat(volume,path,0644));
+		if ((ret!=0) && (ret!=-EEXIST)) return ret;
+	}
+
+	if ((ret=ml_open(volume,path,flags,file))!=0) {
+		*file=NULL;
+		return negative(ret);
+	}
+	return 0;
+}
+
+int afp_bridge_close(struct afp_volume * volume, const char * path,
+	struct afp_file_info * file)
+{
+	int ret=ml_close(volume,path,file);
+
+	/* On failure the library still has it in the volume's open list and
+	 * frees it at unmount. */
+	if (ret==0) free(file);
+	return negative(ret);
+}
+
+int afp_bridge_read(struct afp_volume * volume, const char * path,
+	struct afp_file_info * file, void * buf, unsigned int len,
+	unsigned long long offset)
+{
+	int eof=0;
+	int ret;
+
+	if ((ret=check_path(path))!=0) return ret;
+	if ((ret=check_range(offset,len))!=0) return ret;
+	return ml_read(volume,path,(char *) buf,len,(off_t) offset,file,&eof);
+}
+
+int afp_bridge_write(struct afp_volume * volume, const char * path,
+	struct afp_file_info * file, const void * buf, unsigned int len,
+	unsigned long long offset)
+{
+	int ret;
+
+	if ((ret=check_path(path))!=0) return ret;
+	if ((ret=check_range(offset,len))!=0) return ret;
+	return ml_write(volume,path,(const char *) buf,len,(off_t) offset,
+		file,0,0);
+}
+
+int afp_bridge_list(struct afp_volume * volume, const char * path,
+	struct afp_file_info ** entries)
+{
+	int is_dir=0;
+	unsigned long long size=0;
+	int ret;
+
+	*entries=NULL;
+	/* ml_readdir() gives an empty listing for a path that is not there. */
+	if ((ret=afp_bridge_stat(volume,path,&is_dir,&size))!=0) return ret;
+	if (!is_dir) return -ENOTDIR;
+
+	if ((ret=ml_readdir(volume,path,entries))!=0) {
+		afp_ml_filebase_free(entries);
+		return negative(ret);
+	}
+	return 0;
+}
+
+const char * afp_bridge_entry_name(const struct afp_file_info * entry)
+{
+	return entry->name;
+}
+
+int afp_bridge_entry_is_dir(const struct afp_file_info * entry)
+{
+	return entry->isdir ? 1 : 0;
+}
+
+unsigned long long afp_bridge_entry_size(const struct afp_file_info * entry)
+{
+	return entry->size;
+}
+
+struct afp_file_info * afp_bridge_entry_next(const struct afp_file_info * entry)
+{
+	return entry->next;
+}
+
+void afp_bridge_list_free(struct afp_file_info * entries)
+{
+	afp_ml_filebase_free(&entries);
+}
+
+int afp_bridge_remove(struct afp_volume * volume, const char * path)
+{
+	int ret=check_path(path);
+
+	return ret ? ret : negative(ml_unlink(volume,path));
+}
+
+int afp_bridge_rename(struct afp_volume * volume, const char * from,
+	const char * to)
+{
+	int ret=check_path(from);
+
+	if (ret==0) ret=check_path(to);
+	return ret ? ret : negative(ml_rename(volume,from,to));
+}
+
+int afp_bridge_mkdir(struct afp_volume * volume, const char * path)
+{
+	int ret=check_path(path);
+
+	return ret ? ret : negative(ml_mkdir(volume,path,0755));
+}
+
+int afp_bridge_rmdir(struct afp_volume * volume, const char * path)
+{
+	int ret=check_path(path);
+
+	return ret ? ret : negative(ml_rmdir(volume,path));
 }
