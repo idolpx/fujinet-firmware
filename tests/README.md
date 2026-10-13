@@ -35,6 +35,7 @@ Host-side unit tests and policy checks for the FujiNet-PC build. ctest runs them
 | `AfpServerListTests.cpp`, `AfpServerListHelper.c` | afpfs-ng server reuse by address, signature and user over loopback sockets (`afp_server_list_tests`; not built on Windows) |
 | `AfpCloseSessionTests.cpp`, `AfpCloseSessionHelper.c` | afpfs-ng when the server ends a session with a volume mounted: the event loop keeps running and the server is freed later by a caller (`afp_close_session_tests`; not built on Windows) |
 | `AfpLoginCauseTests.cpp`, `AfpLoginCauseHelper.c` | The cause `afp_server_full_connect()` leaves in `errno` when a login fails: unresolvable name, refused connection (`afp_login_cause_tests`; not built on Windows) |
+| `AfpDirLookupTests.cpp`, `AfpDirLookupHelper.c` | afpfs-ng create, remove, mkdir, rmdir and rename when the parent directory does not exist, against a loopback server on which nothing exists: one lookup, then nothing more is sent (`afp_dir_lookup_tests`; not built on Windows; also links `AfpCloseSessionHelper.c`) |
 | `CasTapeTests.cpp`, `CassetteRewindRequestTests.cpp`, `CassetteTrailTests.cpp` | Atari cassette record timing, rewind request and trail (`cassette_tests`) |
 | `CasFSKTests.cpp` | `lib/media/atari/casFSK.cpp` run scan, chunk checks and timing (`casfsk_tests`) |
 | `CasFSKLoaderTests.cpp` | The value-to-symbol encoder in `casFSK.h` and the progressive loader in `lib/media/atari/casFSKLoader.cpp` (`casfskloader_tests`) |
