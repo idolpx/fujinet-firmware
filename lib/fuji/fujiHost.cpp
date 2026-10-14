@@ -9,6 +9,7 @@
 #include "fnFsTNFS.h"
 #include "fnFsSMB.h"
 #include "fnFsNFS.h"
+#include "fnFsAFP.h"
 #include "fnFsFTP.h"
 #include "fnFsHTTP.h"
 
@@ -50,6 +51,7 @@ void fujiHost::set_type(fujiHostType type)
     case HOSTTYPE_TNFS:
     case HOSTTYPE_SMB:
     case HOSTTYPE_NFS:
+    case HOSTTYPE_AFP:
     case HOSTTYPE_FTP:
     case HOSTTYPE_HTTP:
         cleanup();
@@ -114,6 +116,7 @@ uint16_t fujiHost::dir_tell()
     case HOSTTYPE_TNFS:
     case HOSTTYPE_SMB:
     case HOSTTYPE_NFS:
+    case HOSTTYPE_AFP:
     case HOSTTYPE_FTP:
     case HOSTTYPE_HTTP:
         result = _fs->dir_tell();
@@ -137,6 +140,7 @@ success_is_true fujiHost::dir_seek(uint16_t pos)
     case HOSTTYPE_TNFS:
     case HOSTTYPE_SMB:
     case HOSTTYPE_NFS:
+    case HOSTTYPE_AFP:
     case HOSTTYPE_FTP:
     case HOSTTYPE_HTTP:
         result = _fs->dir_seek(pos);
@@ -170,6 +174,7 @@ success_is_true fujiHost::dir_open(const char *path, const char *pattern, uint16
     case HOSTTYPE_TNFS:
     case HOSTTYPE_SMB:
     case HOSTTYPE_NFS:
+    case HOSTTYPE_AFP:
     case HOSTTYPE_FTP:
     case HOSTTYPE_HTTP:
         result = _fs->dir_open(realpath, pattern, options);
@@ -190,6 +195,7 @@ fsdir_entry_t *fujiHost::dir_nextfile()
     case HOSTTYPE_TNFS:
     case HOSTTYPE_SMB:
     case HOSTTYPE_NFS:
+    case HOSTTYPE_AFP:
     case HOSTTYPE_FTP:
     case HOSTTYPE_HTTP:
         return _fs->dir_read();
@@ -482,6 +488,45 @@ int fujiHost::mount_nfs()
     return -1;
 }
 
+int fujiHost::mount_afp()
+{
+    Debug_printf("::mount_afp {%d:%d} \"%s\"\n", slotid, _type, _hostname);
+
+    // Don't do anything if that's already what's set
+    if (_type == HOSTTYPE_AFP)
+    {
+        if (_fs != nullptr && _fs->running())
+        {
+            Debug_printf("::mount_afp Currently connected to volume \"%s\"\n", _hostname);
+            return 0;
+        }
+        if (_fs != nullptr)
+        {
+            delete _fs;
+            _fs = nullptr;
+        }
+    }
+    else
+        set_type(HOSTTYPE_AFP); // Only start fresh if not HOSTTYPE_AFP
+
+    _fs = new FileSystemAFP;
+
+    if (_fs == nullptr)
+    {
+        Debug_println("Couldn't create a new FileSystemAFP in fujiHost::mount_afp!");
+    }
+    else
+    {
+        Debug_printf("Starting FileSystemAFP(\"%s\")\n", _hostname);
+        if (((FileSystemAFP *)_fs)->start(_hostname).is_success())
+        {
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
 int fujiHost::mount_ftp()
 {
     Debug_printf("::mount_ftp {%d:%d} \"%s\"\n", slotid, _type, _hostname);
@@ -579,6 +624,7 @@ int fujiHost::unmount_fs()
 *  We expect a valid devicename, currently:
 *  "SD" = local
 *  "smb://" = SMB share
+*  "afp://" = AFP volume
 *  "ftp://" = FTP server
 *  "http://" or "https://" = Web server with file/dir-like access
 *  anything else = TNFS
@@ -601,6 +647,9 @@ success_is_true fujiHost::mount()
 
     if (0 == strncasecmp("nfs://", _hostname, 6))
         RETURN_SUCCESS_IF(0 == mount_nfs());
+
+    if (0 == strncasecmp("afp://", _hostname, 6))
+        RETURN_SUCCESS_IF(0 == mount_afp());
 
     if (0 == strncasecmp("ftp://", _hostname, 6))
         RETURN_SUCCESS_IF(0 == mount_ftp());
