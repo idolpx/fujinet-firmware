@@ -11,7 +11,7 @@ filesystems work without a kernel VFS driver.
 | `fnFsSD.*` | `FileSystemSDFAT` and global `fnSDFAT`: the SD card on ESP, a local directory on PC |
 | `fnFsLittleFS.*`, `fnFsSPIFFS.*`, `fsFlash.h` | `FileSystemLittleFS` under `FLASH_LITTLEFS` (ESP) or `FileSystemSPIFFS` under `FLASH_SPIFFS` (PC); whichever is active defines the global `fsFlash` |
 | `fnFsTNFS.*`, `fnFsTNFSvfs.*` | `FileSystemTNFS` and global `fnTNFS` over [lib/TNFSlib/](../TNFSlib/); the VFS shim registers each mount with ESP-IDF so stdio works on ESP; a `_tcp.` or `_udp.` hostname prefix picks the transport |
-| `fnFsSMB.*`, `fnFsNFS.*`, `fnFsFTP.*`, `fnFsHTTP.*` | `FileSystemSMB` (libsmb2), `FileSystemNFS` (libnfs), `FileSystemFTP` over [lib/ftp/](../ftp/), `FileSystemHTTP` over index pages parsed by `IndexParser` |
+| `fnFsSMB.*`, `fnFsNFS.*`, `fnFsAFP.*`, `fnFsFTP.*`, `fnFsHTTP.*` | `FileSystemSMB` (libsmb2), `FileSystemNFS` (libnfs), `FileSystemAFP` (afpfs-ng through [lib/afp/](../afp/)), `FileSystemFTP` over [lib/ftp/](../ftp/), `FileSystemHTTP` over index pages parsed by `IndexParser` |
 | `fnFile.h`, `fnFile.cpp` | `FileHandler` (abstract): `read`, `write`, `seek`, `tell`, `flush`, `close` |
 | `fnFileLocal.*`, `fnFileTNFS.*`, `fnFileSMB.*`, `fnFileNFS.*`, `fnFileAFP.*`, `fnFileMem.*`, `fnFileHTTP.*` | `FileHandler` backends: a stdio `FILE`, TNFS (PC only), SMB, NFS, AFP, an in-memory buffer, and ranged HTTP GET with read-ahead |
 | `fnio.h`, `fnio.cpp` | `fnFile` and the `fnio` wrappers: `FileHandler` on ATARI, APPLE, COCO, RS232 and PC ADAM, a stdio `FILE` everywhere else (`FNIO_IS_STDIO`) |
@@ -24,7 +24,7 @@ filesystems work without a kernel VFS driver.
 - [lib/fuji/](../fuji/) creates one backend per host slot. `fnSDFAT` and `fsFlash` are used directly
   by config, the printers, the web server, app keys and the password store.
 - A device includes `fnio.h` to read an image; which file API it gets depends on the platform.
-- Uses [lib/tcpip/](../tcpip/), [lib/TNFSlib/](../TNFSlib/), [lib/ftp/](../ftp/),
+- Uses [lib/tcpip/](../tcpip/), [lib/TNFSlib/](../TNFSlib/), [lib/ftp/](../ftp/), [lib/afp/](../afp/),
   [lib/webdav/](../webdav/) for `IndexParser`, the HTTP client from [lib/http/](../http/), and the
   libsmb2 and libnfs components.
 
