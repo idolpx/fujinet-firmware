@@ -7,6 +7,7 @@ project(fujinet-pc)
 # C++ standard
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
+add_compile_options(-Werror)
 
 
 if(FUJINET_TARGET STREQUAL "ATARI")
@@ -149,7 +150,7 @@ set(INCLUDE_DIRS include
     lib/network-protocol
     lib/fuji lib/bus lib/device lib/media
     lib/device/fujiDevice lib/device/fujiClock lib/device/NDevice
-    lib/encrypt lib/base64
+    lib/encrypt
     lib/devrelay/commands lib/devrelay/service lib/devrelay/slip lib/devrelay/types
     lib/encoding
     components_pc/mongoose
@@ -228,7 +229,10 @@ set(SOURCES src/main.cpp
     lib/ftp/fnFTP.h lib/ftp/fnFTP.cpp
     lib/TNFSlib/tnfslibMountInfo.h lib/TNFSlib/tnfslibMountInfo.cpp
     lib/TNFSlib/tnfslib.h lib/TNFSlib/tnfslib.cpp
+    lib/TNFSlib/tnfslib_internal.h lib/TNFSlib/tnfslib_dir.cpp
+    lib/TNFSlib/tnfslib_transport.cpp lib/TNFSlib/tnfslib_codes.cpp
     lib/TNFSlib/tnfslib_udp.h lib/TNFSlib/tnfslib_udp_testing.cpp
+    lib/TNFSlib/tnfslib_framing.h lib/TNFSlib/tnfslib_framing.cpp
     lib/telnet/libtelnet.h lib/telnet/libtelnet.c
     lib/fnjson/fnjson.h lib/fnjson/fnjson.cpp
     lib/fnhtml/fnhtml.h lib/fnhtml/fnhtml.cpp

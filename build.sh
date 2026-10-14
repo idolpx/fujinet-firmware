@@ -6,7 +6,7 @@
 # CONFIGURATION INI FILE USAGE
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-PIO_VENV_ROOT="${PLATFORMIO_CORE_DIR:-${HOME}/.platformio/penv}"
+PIO_VENV_ROOT="${PLATFORMIO_CORE_DIR:-${HOME}/.platformio}/penv"
 PC_VENV_ROOT="${SCRIPT_DIR}/build/.venv"
 
 BUILD_ALL=0
@@ -423,7 +423,7 @@ if [ ! -z "$PC_TARGET" ] ; then
     rm -f $SCRIPT_DIR/build/.ninja* 2>/dev/null
   fi
 
-  python "${SCRIPT_DIR}/build_prereqs.py" --pc ${PREREQ_YES} || exit 1
+  ${PYTHON} "${SCRIPT_DIR}/build_prereqs.py" --pc ${PREREQ_YES} || exit 1
 
   cd $SCRIPT_DIR/build
   # Write out the compile commands for clangd etc to use

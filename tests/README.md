@@ -8,6 +8,7 @@ Host-side unit tests and policy checks for the FujiNet-PC build. ctest runs them
 |---|---|
 | `CMakeLists.txt` | One `add_executable` and `add_test` pair per test; each links only the unit under test, never the `fujinet` executable |
 | `FujiBusPacketTests.cpp` | `lib/bus/rs232/FujiBusPacket.cpp` SLIP framing (`fujibuspacket_tests`) |
+| `DaisyChainTests.cpp` | `lib/bus/DaisyChain.cpp` device-ID rotation behind the disk swap (`daisychain_tests`) |
 | `FnSanitizeTests.cpp` | `lib/fntext/fn_sanitize.cpp` entity decoding and UTF-8 folding (`fn_sanitize_tests`) |
 | `FnxmlQueryTests.cpp` | `lib/fnxml/fnxml_query.cpp` XPath subset over tinyxml2 (`fnxml_query_tests`) |
 | `CalendarTests.cpp` | `lib/utils/fn_time.cpp` and `lib/network-protocol/calendar_draft.cpp` (`calendar_tests`) |
@@ -50,11 +51,15 @@ Host-side unit tests and policy checks for the FujiNet-PC build. ctest runs them
 | `CasFSKLoaderTests.cpp` | The value-to-symbol encoder in `casFSK.h` and the progressive loader in `lib/media/atari/casFSKLoader.cpp` (`casfskloader_tests`) |
 | `CassetteFSKReadTests.cpp` | `lib/device/sio/cassetteFSKRead.cpp` over a fake remote file that loses its position (`cassettefskread_tests`) |
 | `FSKTestImages.h` | Synthetic A8CAS images, a fake file and an encoder oracle shared by the two FSK test files above |
+| `TnfsFramingTests.cpp` | `lib/TNFSlib/tnfslib_framing.cpp` reply lengths, split and coalesced streams, malformed input (`tnfs_framing_tests`) |
+| `TnfsTcpRecvTests.cpp` | The real `lib/TNFSlib` client over TCP against a scripted server: split, merged, late, stale, malformed and cut-off replies, closed connections, failed MOUNT and EAGAIN; UDP and the UDP fallback unchanged (`tnfs_tcp_recv_tests`) |
+| `tnfs_harness/` | Stand-ins for `fnSystem.h` (a virtual clock), `bus.h`, `fnDNS.h`, `utils.h`, `fnTcpClient.h` and `fnUDP.h`, the last two backed by the scripted peer in `harness_server.h`; used by `tnfs_tcp_recv_tests` |
 | `check_no_build_ifdefs.py` | Policy: no `BUILD_*` macro in a preprocessor conditional under `lib/device/fujiDevice`, `lib/device/fujiClock` or `lib/device/NDevice` (`no_build_ifdefs_in_fujidevice`) |
 | `check_no_system_bus.py` | Policy: `SYSTEM_BUS` must not appear in any source under `lib/media` (`no_system_bus_in_media`) |
 | `unsit.c`, `stuffit_test.sh` | Host CLI over `lib/stuffit` and a comparison against `unar` (`stuffit_sample_tests`; registered only with `SIT_SAMPLES_DIR`) |
 | `ndif_blocks_test.c`, `ndif_test.sh` | NDIF decoding compared with ndif2raw (`ndif_sample_tests`; registered only with `NDIF2RAW_DIR`) |
-| `esp_stubs/` | Stand-ins for ESP-IDF headers so ESP-only code compiles on a host: no-op `esp_err.h` and `esp_log.h` for `http_header_tests`, and the `http_method` names in `http_parser.h` for `webdav_methods_tests` |
+| `webdav_transfer_test.py`, `webdav/` | Files moving through the ESP-only WebDAV server over the real `lib/http/webdav` and Meatloaf `FlashMFile` code (`webdav_transfer_tests`; POSIX hosts). The script mirrors the sources into the build directory with `meatloaf.cpp` trimmed to the Flash filesystem; `webdav/` holds the fake `esp_http_server`, the stand-in headers and the doctest cases |
+| `esp_stubs/` | Stand-ins for ESP-IDF headers so ESP-only code compiles on a host: no-op `esp_err.h` and `esp_log.h` for `http_header_tests`, and the `http_method` names and `http_method_str()` in `http_parser.h` for the WebDAV tests |
 | `corpus_manifest.txt` | Provenance of the StuffIt sample archives; data only, read by nothing |
 
 ## How it fits

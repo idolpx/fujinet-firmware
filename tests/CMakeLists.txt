@@ -18,6 +18,23 @@ target_link_libraries(fujibuspacket_tests PRIVATE
 add_test(NAME fujibuspacket_tests COMMAND fujibuspacket_tests)
 
 # ------------------------------------------------------------------------------
+# lib/bus/DaisyChain: device-ID rotation behind the disk swap. Pure code; the
+# test supplies its own empty virtualDevice.
+# ------------------------------------------------------------------------------
+add_executable(daisychain_tests
+    DaisyChainTests.cpp
+    ${CMAKE_SOURCE_DIR}/lib/bus/DaisyChain.cpp
+)
+
+target_include_directories(daisychain_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/include/
+    ${CMAKE_SOURCE_DIR}/lib/bus/
+    ${CMAKE_SOURCE_DIR}/components_pc/   # doctest
+)
+
+add_test(NAME daisychain_tests COMMAND daisychain_tests)
+
+# ------------------------------------------------------------------------------
 # UTF-8 / HTML-entity folding to ASCII. fn_sanitize is deliberately free of any
 # parser or protocol dependency, so the entity tables and the transliteration
 # edge cases are pinned here rather than on hardware.
@@ -363,6 +380,22 @@ target_include_directories(webdav_methods_tests PRIVATE
 )
 
 add_test(NAME webdav_methods_tests COMMAND webdav_methods_tests)
+
+# Files moving through the ESP-only WebDAV server (#1839), over the real
+# lib/http/webdav and Meatloaf FlashMFile code. Meatloaf does not compile on
+# a host, so webdav_transfer_test.py mirrors the needed sources into the
+# build directory, trims meatloaf.cpp to the Flash filesystem, and compiles
+# them with the stand-ins in tests/webdav/ and a fake esp_http_server.
+if(UNIX)
+  add_test(NAME webdav_transfer_tests COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/webdav_transfer_test.py
+      --compiler ${CMAKE_CXX_COMPILER}
+      --source ${CMAKE_SOURCE_DIR}
+      --work ${CMAKE_CURRENT_BINARY_DIR}/webdav_transfer
+      --mbedtls-include "${MBEDTLS_INCLUDE_DIR}"
+      --mbedtls-lib "${MBEDTLS_LIBRARY_DIR}")
+  set_tests_properties(webdav_transfer_tests PROPERTIES TIMEOUT 300)
+endif()
 
 # ------------------------------------------------------------------------------
 # Macintosh GCR floppy encoder. Pure C++, no platform dependencies. Encodes a
@@ -809,6 +842,53 @@ target_include_directories(cassettefskread_tests PRIVATE
 )
 
 add_test(NAME cassettefskread_tests COMMAND cassettefskread_tests)
+
+# ------------------------------------------------------------------------------
+# TNFS reply framing (lib/TNFSlib/tnfslib_framing.cpp): reply lengths, split and
+# coalesced byte streams, malformed input. Pure code, so it links alone.
+# ------------------------------------------------------------------------------
+add_executable(tnfs_framing_tests
+    TnfsFramingTests.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_framing.cpp
+)
+
+target_include_directories(tnfs_framing_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/
+    ${CMAKE_SOURCE_DIR}/lib/tcpip/       # tnfslib.h -> tnfslibMountInfo.h
+    ${CMAKE_SOURCE_DIR}/lib/compat/
+    ${CMAKE_SOURCE_DIR}/include/         # global_types.h
+    ${CMAKE_SOURCE_DIR}/components_pc/   # doctest
+)
+
+add_test(NAME tnfs_framing_tests COMMAND tnfs_framing_tests)
+
+# ------------------------------------------------------------------------------
+# TNFS over TCP: the real lib/TNFSlib transaction code over the scripted peer in
+# tnfs_harness/ (split, merged, late, malformed and cut-off replies; UDP unchanged).
+# ------------------------------------------------------------------------------
+add_executable(tnfs_tcp_recv_tests
+    TnfsTcpRecvTests.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_dir.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_transport.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_codes.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslibMountInfo.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_framing.cpp
+)
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  target_sources(tnfs_tcp_recv_tests PRIVATE ${CMAKE_SOURCE_DIR}/lib/compat/strlcpy.c)
+endif()
+
+target_include_directories(tnfs_tcp_recv_tests BEFORE PRIVATE
+    ${CMAKE_SOURCE_DIR}/tests/tnfs_harness/   # first: replaces fnTcpClient.h, fnUDP.h, ...
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/
+    ${CMAKE_SOURCE_DIR}/lib/compat/
+    ${CMAKE_SOURCE_DIR}/include/
+    ${CMAKE_SOURCE_DIR}/components_pc/        # doctest
+)
+target_compile_definitions(tnfs_tcp_recv_tests PRIVATE UNIT_TESTS)
+
+add_test(NAME tnfs_tcp_recv_tests COMMAND tnfs_tcp_recv_tests)
 
 # ------------------------------------------------------------------------------
 # lib/stuffit: unsit is a host CLI over the library. The sample tests compare
