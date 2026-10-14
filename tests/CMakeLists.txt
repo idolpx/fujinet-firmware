@@ -464,6 +464,18 @@ target_include_directories(afp_path_tests PRIVATE
 )
 add_test(NAME afp_path_tests COMMAND afp_path_tests)
 
+# lib/afp errno-to-status mapping. afpStatus.cpp needs only the status codes.
+add_executable(afp_status_tests
+    AfpStatusTests.cpp
+    ${CMAKE_SOURCE_DIR}/lib/afp/afpStatus.cpp
+)
+target_include_directories(afp_status_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/lib/afp/
+    ${CMAKE_SOURCE_DIR}/lib/network-protocol/   # status_error_codes.h
+    ${CMAKE_SOURCE_DIR}/components_pc/   # doctest
+)
+add_test(NAME afp_status_tests COMMAND afp_status_tests)
+
 # AfpSession's use counting, against a fake bridge defined in the test.
 # UNIT_TESTS keeps debug.h from pulling in utils.h, which is not linked here.
 add_executable(afp_session_tests
@@ -511,6 +523,40 @@ target_include_directories(afp_session_live_tests PRIVATE
 target_link_libraries(afp_session_live_tests PRIVATE afp_bridge pthread)
 add_test(NAME afp_session_live_tests COMMAND afp_session_live_tests)
 set_tests_properties(afp_session_live_tests PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+
+# NetworkProtocolAFP through its public interface, against a real server.
+# Skips unless AFP_TEST_HOST is set. ATARI-only: Protocol.h needs a concrete
+# systemBus, as sio_dstats_tests does. POSIX only.
+if(FUJINET_TARGET STREQUAL "ATARI" AND NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  add_executable(afp_protocol_live_tests
+    AfpProtocolLiveTests.cpp
+    ${CMAKE_SOURCE_DIR}/lib/network-protocol/NetworkProtocolAFP.cpp
+    ${CMAKE_SOURCE_DIR}/lib/network-protocol/FS.cpp
+    ${CMAKE_SOURCE_DIR}/lib/network-protocol/Protocol.cpp
+    ${CMAKE_SOURCE_DIR}/lib/network-protocol/TCP.cpp
+    ${CMAKE_SOURCE_DIR}/lib/afp/afpSession.cpp
+    ${CMAKE_SOURCE_DIR}/lib/afp/afpFile.cpp
+    ${CMAKE_SOURCE_DIR}/lib/afp/afpPath.cpp
+    ${CMAKE_SOURCE_DIR}/lib/afp/afpStatus.cpp
+    ${CMAKE_SOURCE_DIR}/lib/utils/utils.cpp
+    ${CMAKE_SOURCE_DIR}/lib/utils/string_utils.cpp
+    ${CMAKE_SOURCE_DIR}/lib/utils/peoples_url_parser.cpp
+    ${CMAKE_SOURCE_DIR}/lib/utils/punycode.cpp
+    ${CMAKE_SOURCE_DIR}/lib/utils/U8Char.cpp
+    ${CMAKE_SOURCE_DIR}/lib/tcpip/fnTcpClient.cpp
+    ${CMAKE_SOURCE_DIR}/lib/tcpip/fnTcpServer.cpp
+    ${CMAKE_SOURCE_DIR}/lib/tcpip/fnDNS.cpp
+    ${CMAKE_SOURCE_DIR}/lib/compat/compat_gettimeofday.c
+    ${CMAKE_SOURCE_DIR}/lib/compat/compat_inet.c
+    )
+  target_include_directories(afp_protocol_live_tests PRIVATE
+    $<TARGET_PROPERTY:sio_network_stubs,INTERFACE_INCLUDE_DIRECTORIES>)
+  target_compile_definitions(afp_protocol_live_tests PRIVATE
+    $<TARGET_PROPERTY:sio_network_stubs,INTERFACE_COMPILE_DEFINITIONS>)
+  target_link_libraries(afp_protocol_live_tests PRIVATE afp_bridge pthread)
+  add_test(NAME afp_protocol_live_tests COMMAND afp_protocol_live_tests)
+  set_tests_properties(afp_protocol_live_tests PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+endif()
 
 # The server list itself, over loopback sockets. POSIX only.
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")

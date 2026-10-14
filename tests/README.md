@@ -30,10 +30,12 @@ Host-side unit tests and policy checks for the FujiNet-PC build. ctest runs them
 | `AfpLoopTests.cpp` | The afpfs-ng event loop leaves the host's `SIGINT` and `SIGTERM` handlers in place (`afp_loop_tests`) |
 | `AfpSocketTests.cpp` | `components/afpfs-ng/lib/afp_socket.h`: failures reach `errno`, and a write after the peer hung up does not raise `SIGPIPE` (`afp_socket_tests`) |
 | `AfpPathTests.cpp` | `lib/afp/afpPath.cpp` splitting a URL path into volume and path (`afp_path_tests`) |
+| `AfpStatusTests.cpp` | `afp_errno_to_status()` in `lib/afp/afpStatus.cpp`: file, path and login errors to `NDEV_STATUS` (`afp_status_tests`) |
 | `AfpSessionTests.cpp` | `lib/afp/afpSession.cpp` sharing of logins and attachments, against the fake in `AfpFakeBridge.h` (`afp_session_tests`) |
 | `AfpFileTests.cpp` | `lib/afp/afpFile.cpp` open modes, positions, listings and the directory functions, against the same fake (`afp_file_tests`) |
 | `AfpFakeBridge.h` | An in-memory `afpBridge` for the two tests above: one server per user, logout with the last volume, and a small file tree per volume |
 | `AfpSessionLiveTests.cpp` | `AfpSession`, `AfpFile` and the directory functions over the real `afpBridge.c` and a real server named by `AFP_TEST_HOST`, `AFP_TEST_USER`, `AFP_TEST_PASSWORD` and `AFP_TEST_VOLUME`, with an optional second account in `AFP_TEST_USER2` and `AFP_TEST_PASSWORD2`; creates and removes `/fujinet-afp-test-<pid>` on that volume; skipped when unset (`afp_session_live_tests`) |
+| `AfpProtocolLiveTests.cpp` | `NetworkProtocolAFP` through its public interface against a real server: volume and directory listings, write, read, append, update, rename, delete, mkdir, rmdir and the status each failure reports; skips unless `AFP_TEST_HOST` is set (`afp_protocol_live_tests`; ATARI only, not built on Windows) |
 | `AfpServerListTests.cpp`, `AfpServerListHelper.c` | afpfs-ng server reuse by address, signature and user over loopback sockets (`afp_server_list_tests`; not built on Windows) |
 | `AfpCloseSessionTests.cpp`, `AfpCloseSessionHelper.c` | afpfs-ng when the server ends a session with a volume mounted: the event loop keeps running and the server is freed later by a caller (`afp_close_session_tests`; not built on Windows) |
 | `AfpOpenTests.cpp`, `AfpOpenHelper.c` | That a failed `ml_open()` hands back no handle and leaves no fork open or listed: refused truncate, missing directory (`afp_open_tests`; not built on Windows) |
