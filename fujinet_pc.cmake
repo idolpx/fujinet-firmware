@@ -208,6 +208,7 @@ set(SOURCES src/main.cpp
     lib/FileSystem/fnFsTNFS.h lib/FileSystem/fnFsTNFS.cpp
     lib/FileSystem/fnFsSMB.h lib/FileSystem/fnFsSMB.cpp
     lib/FileSystem/fnFsNFS.h lib/FileSystem/fnFsNFS.cpp
+    lib/FileSystem/fnFsAFP.h lib/FileSystem/fnFsAFP.cpp
     lib/FileSystem/fnFsFTP.h lib/FileSystem/fnFsFTP.cpp
     lib/FileSystem/fnFsHTTP.h lib/FileSystem/fnFsHTTP.cpp
     lib/FileSystem/fnFile.h lib/FileSystem/fnFile.cpp
@@ -215,6 +216,7 @@ set(SOURCES src/main.cpp
     lib/FileSystem/fnFileTNFS.h lib/FileSystem/fnFileTNFS.cpp
     lib/FileSystem/fnFileSMB.h lib/FileSystem/fnFileSMB.cpp
     lib/FileSystem/fnFileNFS.h lib/FileSystem/fnFileNFS.cpp
+    lib/FileSystem/fnFileAFP.h lib/FileSystem/fnFileAFP.cpp
     lib/FileSystem/fnFileMem.h lib/FileSystem/fnFileMem.cpp
     lib/FileSystem/fnFileHTTP.h lib/FileSystem/fnFileHTTP.cpp
     lib/FileSystem/fnio.h lib/FileSystem/fnio.cpp
