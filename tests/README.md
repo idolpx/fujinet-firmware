@@ -25,7 +25,8 @@ Host-side unit tests and policy checks for the FujiNet-PC build. ctest runs them
 | `mac_gcr_test.cpp` | `lib/media/mac/macGCR.cpp` encode and decode round trip (`mac_gcr_tests`) |
 | `AfpServerMatchTests.cpp` | `components/afpfs-ng/lib/server_match.c` address and user matching for server reuse (`afp_server_match_tests`) |
 | `AfpGcryptTests.cpp` | `components/afpfs-ng/esp32/` gcrypt shim against RFC 1321, RFC 2144 and DES vectors, DES against MbedTLS, and its random source (`afp_gcrypt_tests`) |
-| `AfpMacRomanTests.cpp` | `components/afpfs-ng/lib/macroman.c` MacRoman to UTF-8, including truncation (`afp_macroman_tests`) |
+| `AfpMacRomanTests.cpp` | `components/afpfs-ng/lib/macroman.c` MacRoman to UTF-8 and back, including truncation and the characters MacRoman lacks (`afp_macroman_tests`) |
+| `AfpCodepageTests.cpp` | afpfs-ng `convert_path_to_afp()` and `convert_path_to_unix()` for UTF-8 and long-name (MacRoman) volumes (`afp_codepage_tests`) |
 | `AfpUamTests.cpp` | The whole `afpfs_fn` library linked on the host, and its registered login methods (`afp_uam_tests`) |
 | `AfpLoopTests.cpp` | The afpfs-ng event loop leaves the host's `SIGINT` and `SIGTERM` handlers in place (`afp_loop_tests`) |
 | `AfpSocketTests.cpp` | `components/afpfs-ng/lib/afp_socket.h`: failures reach `errno`, and a write after the peer hung up does not raise `SIGPIPE` (`afp_socket_tests`) |
