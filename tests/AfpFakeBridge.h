@@ -42,6 +42,7 @@ struct afp_file_info
     std::string path;
     bool dir = false;
     unsigned long long size = 0;
+    int mode = AFP_BRIDGE_READ; // how an open file was opened
     afp_file_info *next = nullptr;
 };
 
@@ -58,6 +59,8 @@ struct Fake
     int stat_error = 0;              // make every stat fail with this
     size_t max_read = 0;             // cap one read, as a server quantum does
     int login_error = 0;
+    int lists = 0;
+    std::string last_user, last_password;
 
     void reset()
     {
@@ -69,6 +72,9 @@ struct Fake
         stat_error = 0;
         max_read = 0;
         login_error = 0;
+        lists = 0;
+        last_user.clear();
+        last_password.clear();
     }
 } fake;
 
@@ -107,9 +113,11 @@ int afp_bridge_start(afp_bridge_log_fn, afp_bridge_gone_fn gone)
     return fake.fail_start ? -1 : 0;
 }
 
-afp_server *afp_bridge_login(const char *, int, const char *user, const char *, int *error)
+afp_server *afp_bridge_login(const char *, int, const char *user, const char *password, int *error)
 {
     fake.logins++;
+    fake.last_user = user;
+    fake.last_password = password;
     if (fake.login_error)
     {
         *error = fake.login_error;
@@ -204,6 +212,7 @@ int afp_bridge_open(afp_volume *volume, const char *path, int mode, afp_file_inf
     *file = new afp_file_info;
     (*file)->volume = volume;
     (*file)->path = path;
+    (*file)->mode = mode;
     return 0;
 }
 
@@ -214,9 +223,11 @@ int afp_bridge_close(afp_volume *, const char *, afp_file_info *file)
     return 0;
 }
 
-int afp_bridge_read(afp_volume *volume, const char *path, afp_file_info *, void *buf, unsigned int len,
+int afp_bridge_read(afp_volume *volume, const char *path, afp_file_info *file, void *buf, unsigned int len,
                     unsigned long long offset)
 {
+    // A fork opened only for writing cannot be read, as on a real server.
+    if (file->mode == AFP_BRIDGE_WRITE || file->mode == AFP_BRIDGE_APPEND) return -EACCES;
     const std::string &data = volume->nodes[path].data;
     if (offset >= data.size()) return 0;
     size_t n = std::min<size_t>(len, data.size() - offset);
@@ -225,9 +236,10 @@ int afp_bridge_read(afp_volume *volume, const char *path, afp_file_info *, void 
     return static_cast<int>(n);
 }
 
-int afp_bridge_write(afp_volume *volume, const char *path, afp_file_info *, const void *buf, unsigned int len,
+int afp_bridge_write(afp_volume *volume, const char *path, afp_file_info *file, const void *buf, unsigned int len,
                      unsigned long long offset)
 {
+    if (file->mode == AFP_BRIDGE_READ) return -EACCES;
     std::string &data = volume->nodes[path].data;
     if (data.size() < offset + len) data.resize(offset + len);
     std::memcpy(&data[offset], buf, len);
@@ -237,6 +249,7 @@ int afp_bridge_write(afp_volume *volume, const char *path, afp_file_info *, cons
 int afp_bridge_list(afp_volume *volume, const char *path, afp_file_info **entries)
 {
     *entries = nullptr;
+    fake.lists++;
     const std::string dir = path;
     if (dir != "/" && volume->nodes.find(dir) == volume->nodes.end()) return -ENOENT;
     if (!is_dir(*volume, dir)) return -ENOTDIR;
